@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,8 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef TENSORFLOW_KERNELS_AGGREGATE_OPS_CPU_H_
-#define TENSORFLOW_KERNELS_AGGREGATE_OPS_CPU_H_
+#ifndef TENSORFLOW_CORE_KERNELS_AGGREGATE_OPS_CPU_H_
+#define TENSORFLOW_CORE_KERNELS_AGGREGATE_OPS_CPU_H_
 
 #include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
 #include "tensorflow/core/framework/tensor_types.h"
@@ -22,6 +22,7 @@ limitations under the License.
 #include "tensorflow/core/kernels/aggregate_ops.h"
 
 typedef Eigen::ThreadPoolDevice CPUDevice;
+
 
 namespace tensorflow {
 
@@ -133,8 +134,9 @@ struct Add9Functor<CPUDevice, T> {
   }
 };
 
+
 }  // namespace functor
 
 }  // namespace tensorflow
 
-#endif  // TENSORFLOW_KERNELS_AGGREGATE_OPS_CPU_H_
+#endif  // TENSORFLOW_CORE_KERNELS_AGGREGATE_OPS_CPU_H_

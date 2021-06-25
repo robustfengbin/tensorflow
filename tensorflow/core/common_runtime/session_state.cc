@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,6 +17,11 @@ limitations under the License.
 #include "tensorflow/core/graph/tensor_id.h"
 
 namespace tensorflow {
+
+// Adjust value in third_party/tensorflow/python/client/tf_session_wrapper.cc
+// in the get_tensor_handle_key function if adjusting the value for
+// kTensorHandleResourceTypeName.
+const char* SessionState::kTensorHandleResourceTypeName = "TensorHandle";
 
 Status SessionState::GetTensor(const string& handle, Tensor* tensor) {
   mutex_lock l(state_lock_);
@@ -58,17 +63,18 @@ Status TensorStore::AddTensor(const string& name, const TensorAndKey& tk) {
     return errors::InvalidArgument("Failed to add a tensor with name '", name,
                                    "' to the tensor store.");
   }
+  dirty_ = true;
   return Status::OK();
 }
 
 Status TensorStore::SaveTensors(const std::vector<string>& output_names,
                                 SessionState* session_state) {
   mutex_lock l(lock_);
-  if (tensors_.size() != 0) {
+  if (!tensors_.empty()) {
     // Save only the tensors in output_names in the session.
     for (const string& name : output_names) {
       TensorId id(ParseTensorName(name));
-      const string& op_name = id.first.ToString();
+      const string op_name(id.first);
       auto it = tensors_.find(op_name);
       if (it != tensors_.end()) {
         // Save the tensor to the session state.

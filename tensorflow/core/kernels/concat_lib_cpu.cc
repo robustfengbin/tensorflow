@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,113 +15,94 @@ limitations under the License.
 
 #define EIGEN_USE_THREADS
 
-#include "tensorflow/core/kernels/concat_lib.h"
+#include "tensorflow/core/kernels/concat_lib_cpu.h"
 #include <vector>
 #include "tensorflow/core/framework/register_types.h"
-#include "tensorflow/core/util/work_sharder.h"
+#include "tensorflow/core/kernels/concat_lib.h"
 
 namespace tensorflow {
 
+namespace {
 template <typename T>
-static inline void Copy(T* dst, const T* src, int n) {
-  if (DataTypeCanUseMemcpy(DataTypeToEnum<T>::v())) {
-    memcpy(dst, src, n * sizeof(T));
-  } else {
-    for (int k = 0; k < n; ++k) {
+struct MemCpyCopier {
+  inline void Copy(T* dst, const T* src, int input_index, size_t n) {
+    if (DataTypeCanUseMemcpy(DataTypeToEnum<T>::v())) {
+      memcpy(dst, src, n * sizeof(T));
+    } else {
+      for (size_t k = 0; k < n; ++k) {
+        *dst++ = *src++;
+      }
+    }
+  }
+};
+template <>
+struct MemCpyCopier<ResourceHandle> {
+  inline void Copy(ResourceHandle* dst, const ResourceHandle* src,
+                   int input_index, size_t n) {
+    for (size_t k = 0; k < n; ++k) {
       *dst++ = *src++;
     }
   }
-}
+};
 
 template <typename T>
-void ConcatCPU(DeviceBase* d,
-               const std::vector<
-                   std::unique_ptr<typename TTypes<T, 2>::ConstMatrix>>& inputs,
-               typename TTypes<T, 2>::Matrix* output) {
-  int num_inputs = inputs.size();
-  std::vector<ptrdiff_t> sizes;
-  sizes.reserve(num_inputs);
-  int64 row_size = 0;
-  for (int j = 0; j < num_inputs; ++j) {
-    sizes.push_back(inputs[j]->dimension(1));
-    row_size += sizes.back();
-  }
+int64 EstimateBytesPerElement(
+    const std::vector<std::unique_ptr<typename TTypes<T, 2>::ConstMatrix>>&
+        inputs) {
+  return sizeof(T);
+}
 
-  auto worker_threads = d->tensorflow_cpu_worker_threads();
-  int num_threads = std::min<int>(std::min(4, worker_threads->num_threads),
-                                  output->size() / 4096);
-  // Single threaded mode.
-  if (num_threads == 0) {
-    T* out = &(*output)(0, 0);
-    std::vector<const T*> inp;
-    inp.reserve(num_inputs);
-    for (int j = 0; j < num_inputs; ++j) {
-      inp.push_back(&(*inputs[j])(0, 0));
-    }
-    const int dim0 = output->dimension(0);
-    for (int i = 0; i < dim0; ++i) {
-      for (int j = 0; j < num_inputs; ++j) {
-        auto size = sizes[j];
-        Copy(out, inp[j], size);
-        out += size;
-        inp[j] += size;
-      }
-    }
-    return;
-  }
-
-  // Sharded mode.
-  auto work = [&row_size, &sizes, &inputs, &output, &num_inputs](int64 start,
-                                                                 int64 end) {
-    int64 skipped_rows = start / row_size;
-    T* out = output->data() + skipped_rows * row_size;
-    T* out_start = output->data() + start;
-    T* out_end = output->data() + end;
-
-    // Handle partial row at start
-    if (out < out_start) {
-      for (int j = 0; j < num_inputs; ++j) {
-        ptrdiff_t size = sizes[j];
-        ptrdiff_t offset = out_start - out;
-        if (size <= offset) {
-          out += size;
-          continue;
+// EstimateBytesPerElement for strings estimates the total bytes involved in
+// concatenating the strings in the "inputs" matrices (higher-level code
+// reshapes all the inputs to matrices), by sampling the lengths of the actual
+// strings in the various tensors.
+template <>
+int64 EstimateBytesPerElement<tstring>(
+    const std::vector<
+        std::unique_ptr<typename TTypes<tstring, 2>::ConstMatrix>>& inputs) {
+  // randomly sample a few input strings to get a sense of the average size
+  // of each element
+  int num_samples = 0;
+  int64 num_bytes_in_samples = 0;
+  for (const auto& input : inputs) {
+    const auto dim0 = input->dimension(0);
+    const auto dim1 = input->dimension(1);
+    const auto zero = dim0 - dim0;  // Make type match
+    if (dim0 > 0 && dim1 > 0) {
+      // Draw 9 samples of string sizes from the input, in this sort of pattern
+      // ("*" is sample), to get an estimate of the lengths of each string
+      // element in the tensors:
+      //
+      //    *...*...*
+      //    .........
+      //    *...*...*
+      //    .........
+      //    *...*...*
+      for (auto i : {zero, dim0 / 2, dim0 - 1}) {
+        for (auto j : {zero, dim1 / 2, dim1 - 1}) {
+          num_bytes_in_samples += (*input)(i, j).size();
+          num_samples++;
         }
-        const T* inp = &(*inputs[j])(skipped_rows, 0);
-        if (offset > 0) {
-          out += offset;
-          inp += offset;
-          size -= offset;
-        }
-        size = std::min(size, out_end - out);
-        if (size <= 0) break;
-        Copy(out, inp, size);
-        out += size;
       }
-      ++skipped_rows;
     }
-    if (out == out_end) return;
-    CHECK(out >= out_start);
-    CHECK(out < out_end);
+  }
+  // We don't use sizeof(std::string) as the overhead, since that would
+  // overestimate the memory touched for copying a string.
+  int64 string_overhead = sizeof(char*) + sizeof(size_t);
+  return string_overhead +
+         ((num_samples > 0) ? (num_bytes_in_samples / num_samples) : 0);
+}
 
-    // Copy remaining data.
-    std::vector<const T*> inp;
-    inp.reserve(num_inputs);
-    for (int j = 0; j < num_inputs; ++j) {
-      inp.push_back(&(*inputs[j])(skipped_rows, 0));
-    }
-    const int dim0 = output->dimension(0);
-    for (int i = skipped_rows; i < dim0; ++i) {
-      for (int j = 0; j < num_inputs; ++j) {
-        ptrdiff_t size = std::min(sizes[j], out_end - out);
-        Copy(out, inp[j], size);
-        out += size;
-        inp[j] += size;
-        if (out == out_end) return;
-      }
-    }
-  };
-  Shard(num_threads, worker_threads->workers, output->size(), 100, work);
+}  // namespace
+
+template <typename T>
+void ConcatCPU(
+    DeviceBase* d,
+    const std::vector<std::unique_ptr<typename TTypes<T, 2>::ConstMatrix>>&
+        inputs,
+    typename TTypes<T, 2>::Matrix* output) {
+  int64 cost_per_unit = EstimateBytesPerElement<T>(inputs);
+  ConcatCPUImpl<T>(d, inputs, cost_per_unit, MemCpyCopier<T>(), output);
 }
 
 #define REGISTER(T)                                                            \
@@ -132,7 +113,18 @@ void ConcatCPU(DeviceBase* d,
 TF_CALL_ALL_TYPES(REGISTER)
 REGISTER(quint8)
 REGISTER(qint8)
+REGISTER(quint16)
+REGISTER(qint16)
 REGISTER(qint32)
-REGISTER(bfloat16)
+
+#if defined(IS_MOBILE_PLATFORM) && !defined(SUPPORT_SELECTIVE_REGISTRATION) && \
+    !defined(__ANDROID_TYPES_FULL__)
+// Primarily used for SavedModel support on mobile. Registering it here only
+// if __ANDROID_TYPES_FULL__ is not defined (which already registers string)
+// to avoid duplicate registration.
+REGISTER(tstring);
+#endif  // defined(IS_MOBILE_PLATFORM) &&
+        // !defined(SUPPORT_SELECTIVE_REGISTRATION) &&
+        // !defined(__ANDROID_TYPES_FULL__)
 
 }  // namespace tensorflow

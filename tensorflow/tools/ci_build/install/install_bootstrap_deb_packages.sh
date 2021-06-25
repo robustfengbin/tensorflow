@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Copyright 2015 Google Inc. All Rights Reserved.
+# Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,9 +16,12 @@
 
 set -e
 
+# Retry on connection timeout.
+bash -c "echo 'APT::Acquire::Retries \"3\";' > /etc/apt/apt.conf.d/80-retries"
+
 # Install bootstrap dependencies from ubuntu deb repository.
 apt-get update
-apt-get install -y \
-    software-properties-common
+apt-get install -y --no-install-recommends \
+    apt-transport-https ca-certificates software-properties-common
 apt-get clean
 rm -rf /var/lib/apt/lists/*

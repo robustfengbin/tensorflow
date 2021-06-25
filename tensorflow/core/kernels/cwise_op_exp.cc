@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,8 +16,14 @@ limitations under the License.
 #include "tensorflow/core/kernels/cwise_ops_common.h"
 
 namespace tensorflow {
-REGISTER3(UnaryOp, CPU, "Exp", functor::exp, float, double, complex64);
-#if GOOGLE_CUDA
-REGISTER2(UnaryOp, GPU, "Exp", functor::exp, float, double);
+REGISTER6(UnaryOp, CPU, "Exp", functor::exp, float, Eigen::half, bfloat16,
+          double, complex64, complex128);
+
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+#if !defined(MLIR_GENERATED_GPU_KERNELS_ENABLED)
+REGISTER5(UnaryOp, GPU, "Exp", functor::exp, float, Eigen::half, double,
+          complex64, complex128);
 #endif
+#endif
+
 }  // namespace tensorflow

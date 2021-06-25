@@ -1,4 +1,4 @@
-/* Copyright 2016 Google Inc. All Rights Reserved.
+/* Copyright 2016 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -12,8 +12,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
-#ifndef TENSORFLOW_KERNELS_IMMUTABLE_CONSTANT_OP_H_
-#define TENSORFLOW_KERNELS_IMMUTABLE_CONSTANT_OP_H_
+#ifndef TENSORFLOW_CORE_KERNELS_IMMUTABLE_CONSTANT_OP_H_
+#define TENSORFLOW_CORE_KERNELS_IMMUTABLE_CONSTANT_OP_H_
 
 #include <memory>
 
@@ -32,27 +32,18 @@ class ImmutableConstantOp : public OpKernel {
   bool IsExpensive() override { return false; }
   ~ImmutableConstantOp() override;
 
- private:
-  class ReadOnlyMemoryRegionAllocator : public ::tensorflow::Allocator {
-   public:
-    ReadOnlyMemoryRegionAllocator();
-    Status InitWithMemoryRegion(const string& name, Env* env);
-    ~ReadOnlyMemoryRegionAllocator() override;
-    string Name() override;
-    void* AllocateRaw(size_t alignment, size_t num_bytes) override;
-    void DeallocateRaw(void* ptr) override;
-    const Status& allocation_status() const { return allocation_status_; }
+  // Names of attributes that are used by this op
+  static constexpr char const* kDTypeAttr = "dtype";
+  static constexpr char const* kShapeAttr = "shape";
+  static constexpr char const* kMemoryRegionNameAttr = "memory_region_name";
 
-   private:
-    std::unique_ptr<ReadOnlyMemoryRegion> memory_region_;
-    // If there is an error during allocation we keep it in this status.
-    Status allocation_status_;
-  };
-  ReadOnlyMemoryRegionAllocator allocator_;
-  Tensor tensor_;
+ private:
+  string region_name_;
+  DataType dtype_;
+  TensorShape shape_;
   TF_DISALLOW_COPY_AND_ASSIGN(ImmutableConstantOp);
 };
 
 }  // namespace tensorflow
 
-#endif  // TENSORFLOW_KERNELS_IMMUTABLE_CONSTANT_OP_H_
+#endif  // TENSORFLOW_CORE_KERNELS_IMMUTABLE_CONSTANT_OP_H_

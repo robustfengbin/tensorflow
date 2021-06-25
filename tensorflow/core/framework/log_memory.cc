@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,18 +21,21 @@ namespace tensorflow {
 
 const string LogMemory::kLogMemoryLabel = "__LOG_MEMORY__";
 
-bool LogMemory::IsEnabled() { return VLOG_IS_ON(1); }
+bool LogMemory::IsEnabled() { return VLOG_IS_ON(2); }
 
-void LogMemory::OutputToLog(const protobuf::Message& proto) {
-  protobuf::TextFormat::Printer printer;
-  printer.SetExpandAny(true);
-  printer.SetSingleLineMode(true);
-  string contents_string;
-  printer.PrintToString(proto, &contents_string);
+namespace {
 
-  LOG(INFO) << kLogMemoryLabel << " " << proto.GetDescriptor()->name() << " { "
-            << contents_string << " }";
+// Write the proto entry to LOG(INFO).
+template <typename T>
+void OutputToLog(const T& proto) {
+  string type_name = proto.GetTypeName();
+  const size_t index = type_name.find_last_of('.');
+  if (index != string::npos) type_name = type_name.substr(index + 1);
+  LOG(INFO) << LogMemory::kLogMemoryLabel << " " << type_name << " { "
+            << proto.ShortDebugString() << " }";
 }
+
+}  // namespace
 
 void LogMemory::RecordStep(const int64 step_id, const string& handle) {
   MemoryLogStep step;

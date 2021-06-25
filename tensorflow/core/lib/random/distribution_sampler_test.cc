@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -82,8 +82,8 @@ TEST_F(DistributionSamplerTest, KnownDistribution) {
   TestDistribution(kDist1, TF_ARRAYSIZE(kDist1));
 }
 
-static void BM_DistributionSampler(int iters, int n) {
-  testing::StopTiming();
+static void BM_DistributionSampler(::testing::benchmark::State& state) {
+  const int n = state.range(0);
   PhiloxRandom philox(173, 371);
   SimplePhilox rand(&philox);
   std::vector<float> weights(n, 0);
@@ -91,9 +91,8 @@ static void BM_DistributionSampler(int iters, int n) {
     weights[i] = rand.Uniform(100);
   }
   DistributionSampler picker(weights);
-  testing::StartTiming();
   int r = 0;
-  for (int i = 0; i < iters; i++) {
+  for (auto s : state) {
     r |= picker.Sample(&rand);
   }
   CHECK_NE(r, kint32max);

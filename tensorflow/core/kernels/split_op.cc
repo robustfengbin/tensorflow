@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ limitations under the License.
 #define EIGEN_USE_THREADS
 
 #include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
+#include "tensorflow/core/framework/bounds_check.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
 #include "tensorflow/core/framework/tensor.h"
@@ -25,10 +26,13 @@ limitations under the License.
 #include "tensorflow/core/kernels/split_lib.h"
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/lib/gtl/array_slice.h"
-#if GOOGLE_CUDA
+#include "tensorflow/core/util/work_sharder.h"
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 #include "tensorflow/core/common_runtime/gpu/gpu_event_mgr.h"
+#include "tensorflow/core/kernels/gpu_device_array.h"
+#include "tensorflow/core/kernels/split_lib_gpu.h"
 #include "tensorflow/core/platform/stream_executor.h"
-#endif  // GOOGLE_CUDA
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
 namespace tensorflow {
 
@@ -41,15 +45,23 @@ class SplitOpBase : public OpKernel {
   explicit SplitOpBase(OpKernelConstruction* c) : OpKernel(c) {}
 
   void ComputeEasyCases(OpKernelContext* context, bool* done) {
-    const int32 split_dim = context->input(0).flat<int32>()(0);
-    const int32 num_split = num_outputs();
     const Tensor& input = context->input(1);
     const TensorShape& input_shape = input.shape();
+    const Tensor& split_dim_tensor = context->input(0);
+    OP_REQUIRES(
+        context, split_dim_tensor.shape().dims() == 0,
+        errors::InvalidArgument("split_dim must be a scalar but has rank ",
+                                split_dim_tensor.shape().dims()));
+    const int32 split_dim_orig = split_dim_tensor.flat<int32>()(0);
+    const int32 split_dim =
+        split_dim_orig < 0 ? split_dim_orig + input.dims() : split_dim_orig;
+    const int32 num_split = num_outputs();
 
     OP_REQUIRES(
         context, 0 <= split_dim && split_dim < input_shape.dims(),
-        errors::InvalidArgument("0 <= split_dim < number of input dimensions (",
-                                input_shape.dims(), "), but got ", split_dim));
+        errors::InvalidArgument("-input rank(-", input.dims(),
+                                ") <= split_dim < input rank (", input.dims(),
+                                "), but got ", split_dim_orig));
 
     OP_REQUIRES(
         context, num_split > 0,
@@ -89,20 +101,97 @@ class SplitOpBase : public OpKernel {
     }
   }
 
-  std::tuple<int32, int32, int32> SetDims(const TensorShape& input_shape,
-                                          int32 split_dim) const {
+  template <typename IndexType>
+  std::tuple<IndexType, IndexType, IndexType> SetDims(
+      const TensorShape& input_shape, int32 split_dim) const {
+    static_assert(std::is_integral<IndexType>::value,
+                  "IndexType must be an integer type");
     int32 prefix_dim_size = 1;
     for (int i = 0; i < split_dim; ++i) {
       prefix_dim_size *= input_shape.dim_size(i);
     }
 
-    int32 split_dim_size = input_shape.dim_size(split_dim);
+    // Caller must ensure that dim_size and suffix_dim_size are <
+    // std::numeric_limits<IndexType>::max()
+    IndexType split_dim_size =
+        static_cast<IndexType>(input_shape.dim_size(split_dim));
 
-    int32 suffix_dim_size = 1;
+    IndexType suffix_dim_size = 1;
     for (int i = split_dim + 1; i < input_shape.dims(); ++i) {
-      suffix_dim_size *= input_shape.dim_size(i);
+      suffix_dim_size *= static_cast<IndexType>(input_shape.dim_size(i));
     }
     return std::make_tuple(prefix_dim_size, split_dim_size, suffix_dim_size);
+  }
+};
+
+template <typename T, typename InputReshapedType, int NDims>
+class SplitOpCPUImpl {
+ public:
+  template <typename MakeSizesType, typename ReshapeResultType>
+  void operator()(OpKernelContext* context,
+                  const InputReshapedType& input_reshaped,
+                  const TensorShape& input_shape, int32 split_dim,
+                  Eigen::DenseIndex prefix_dim_size,
+                  Eigen::DenseIndex split_dim_size,
+                  Eigen::DenseIndex suffix_dim_size,
+                  const MakeSizesType& make_sizes,
+                  const ReshapeResultType& reshape_result, int32 num_split,
+                  int64 split_dim_output_size) const {
+    const auto num_threads =
+        context->device()->tensorflow_cpu_worker_threads()->num_threads;
+    // TODO(jewillco): Tune heuristic further.
+    const auto input_element_count = input_shape.num_elements();
+    const bool use_parallelism_between_outputs =
+        (num_split >= 4 &&
+         input_element_count >= std::max(num_threads, num_split) * 4096 &&
+         input_element_count < num_split * 180 * 1024);
+    Eigen::DSizes<Eigen::DenseIndex, NDims> indices;
+    for (int i = 0; i < NDims; ++i) {
+      indices[i] = 0;
+    }
+    auto sizes = make_sizes(split_dim_output_size);
+    TensorShape output_shape(input_shape);
+    output_shape.set_dim(split_dim, split_dim_output_size);
+
+    auto range_output_func = [&indices, context, &output_shape, prefix_dim_size,
+                              split_dim_output_size, suffix_dim_size, &sizes,
+                              use_parallelism_between_outputs, &input_reshaped,
+                              &reshape_result](int64 start, int64 limit) {
+      for (int64 i = start; i < limit; ++i) {
+        Tensor* result = nullptr;
+        OP_REQUIRES_OK(context,
+                       context->allocate_output(i, output_shape, &result));
+        if (prefix_dim_size * split_dim_output_size * suffix_dim_size > 0) {
+          Eigen::DSizes<Eigen::DenseIndex, NDims> slice_indices;
+          Eigen::DSizes<Eigen::DenseIndex, NDims> slice_sizes;
+          for (int j = 0; j < NDims; ++j) {
+            slice_indices[j] =
+                (j == NDims - 2 ? i * split_dim_output_size : indices[j]);
+            slice_sizes[j] = sizes[j];
+          }
+
+          auto result_shaped = reshape_result(result, split_dim_output_size);
+
+          if (use_parallelism_between_outputs) {
+            // Use sequential implementation for single output.
+            result_shaped = input_reshaped.slice(slice_indices, slice_sizes);
+          } else {
+            // This implementation may be parallel internally.
+            functor::Split<CPUDevice, T, NDims>()(
+                context->eigen_device<CPUDevice>(), result_shaped,
+                input_reshaped, slice_indices, slice_sizes);
+          }
+        }
+      }
+    };
+    if (use_parallelism_between_outputs) {
+      // Run in parallel, disabling parallelism in functor.
+      context->device()->tensorflow_cpu_worker_threads()->workers->ParallelFor(
+          num_split, input_element_count / num_split, range_output_func);
+    } else {
+      // Run sequentially, but allow internal parallelism in functor.
+      range_output_func(0, num_split);
+    }
   }
 };
 
@@ -118,60 +207,63 @@ class SplitOpCPU : public SplitOpBase<CPUDevice, T> {
     if (!context->status().ok() || done) {
       return;
     }
-    const int32 split_dim = context->input(0).flat<int32>()(0);
     const int32 num_split = Base::num_outputs();
     const Tensor& input = context->input(1);
     const TensorShape& input_shape = input.shape();
+    const int32 split_dim_orig = context->input(0).flat<int32>()(0);
+    const int32 split_dim =
+        split_dim_orig < 0 ? split_dim_orig + input.dims() : split_dim_orig;
 
-    int32 prefix_dim_size;
-    int32 split_dim_size;
-    int32 suffix_dim_size;
+    // Android also uses int32 indexing, so check here also.
+    OP_REQUIRES(
+        context,
+        FastBoundsCheck(input.NumElements(),
+                        std::numeric_limits<Eigen::DenseIndex>::max()),
+        errors::InvalidArgument("Split requires input size < ",
+                                std::numeric_limits<Eigen::DenseIndex>::max()));
+
+    Eigen::DenseIndex prefix_dim_size;
+    Eigen::DenseIndex split_dim_size;
+    Eigen::DenseIndex suffix_dim_size;
 
     std::tie(prefix_dim_size, split_dim_size, suffix_dim_size) =
-        Base::SetDims(input_shape, split_dim);
-    auto input_reshaped =
-        input.shaped<T, 3>({prefix_dim_size, split_dim_size, suffix_dim_size});
+        Base::template SetDims<Eigen::DenseIndex>(input_shape, split_dim);
 
-    const int32 split_dim_output_size = split_dim_size / num_split;
-    TensorShape output_shape(input_shape);
-    output_shape.set_dim(split_dim, split_dim_output_size);
+    const int64 split_dim_output_size = split_dim_size / num_split;
 
-    Eigen::DSizes<Eigen::DenseIndex, 3> indices{0, 0, 0};
-    Eigen::DSizes<Eigen::DenseIndex, 3> sizes{
-        prefix_dim_size, split_dim_output_size, suffix_dim_size};
-
-    for (int i = 0; i < num_split; ++i) {
-      Tensor* result = nullptr;
-      OP_REQUIRES_OK(context,
-                     context->allocate_output(i, output_shape, &result));
-      if (prefix_dim_size * split_dim_output_size * suffix_dim_size > 0) {
-        Eigen::DSizes<Eigen::DenseIndex, 3> slice_indices;
-        Eigen::DSizes<Eigen::DenseIndex, 3> slice_sizes;
-        for (int j = 0; j < 3; ++j) {
-          slice_indices[j] = indices[j];
-          slice_sizes[j] = sizes[j];
-        }
-
-        auto result_shaped = result->shaped<T, 3>(
-            {prefix_dim_size, split_dim_output_size, suffix_dim_size});
-
-        functor::Split<CPUDevice, T>()(context->eigen_device<CPUDevice>(),
-                                       result_shaped, input_reshaped,
-                                       slice_indices, slice_sizes);
-      }
-      indices[1] += split_dim_output_size;
+    if (prefix_dim_size == 1) {
+      auto input_reshaped =
+          input.shaped<T, 2>({split_dim_size, suffix_dim_size});
+      auto make_sizes = [&](Eigen::DenseIndex split_size) {
+        return Eigen::DSizes<Eigen::DenseIndex, 2>{split_size, suffix_dim_size};
+      };
+      auto reshape_result = [&](Tensor* result, Eigen::DenseIndex split_size) {
+        return result->shaped<T, 2>({split_size, suffix_dim_size});
+      };
+      SplitOpCPUImpl<T, decltype(input_reshaped), 2>{}(
+          context, input_reshaped, input_shape, split_dim, prefix_dim_size,
+          split_dim_size, suffix_dim_size, make_sizes, reshape_result,
+          num_split, split_dim_output_size);
+    } else {
+      auto input_reshaped = input.shaped<T, 3>(
+          {prefix_dim_size, split_dim_size, suffix_dim_size});
+      auto make_sizes = [&](Eigen::DenseIndex split_size) {
+        return Eigen::DSizes<Eigen::DenseIndex, 3>{prefix_dim_size, split_size,
+                                                   suffix_dim_size};
+      };
+      auto reshape_result = [&](Tensor* result, Eigen::DenseIndex split_size) {
+        return result->shaped<T, 3>(
+            {prefix_dim_size, split_size, suffix_dim_size});
+      };
+      SplitOpCPUImpl<T, decltype(input_reshaped), 3>{}(
+          context, input_reshaped, input_shape, split_dim, prefix_dim_size,
+          split_dim_size, suffix_dim_size, make_sizes, reshape_result,
+          num_split, split_dim_output_size);
     }
   }
 };
 
-#if GOOGLE_CUDA
-
-template <typename T>
-struct SplitOpGPULaunch {
-  void Run(const Eigen::GpuDevice& d, const T* input, int32 split_dim,
-           int32 prefix_dim_size, int32 split_dim_size, int32 suffix_dim_size,
-           T** output_ptrs_vec);
-};
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
 // Partial specialization for GPU
 template <typename T>
@@ -186,63 +278,50 @@ class SplitOpGPU : public SplitOpBase<GPUDevice, T> {
     if (!context->status().ok() || done) {
       return;
     }
-    const int32 split_dim = context->input(0).flat<int32>()(0);
-    const int32 num_split = Base::num_outputs();
     const Tensor& input = context->input(1);
     const TensorShape& input_shape = input.shape();
-
+    const int32 split_dim_orig = context->input(0).flat<int32>()(0);
+    const int32 split_dim =
+        split_dim_orig < 0 ? split_dim_orig + input.dims() : split_dim_orig;
+    const int32 num_split = Base::num_outputs();
+    OP_REQUIRES(
+        context,
+        FastBoundsCheck(input.NumElements(), std::numeric_limits<int32>::max()),
+        errors::InvalidArgument("Split on GPU requires input size "
+                                "< max int32"));
     int32 prefix_dim_size;
     int32 split_dim_size;
     int32 suffix_dim_size;
     std::tie(prefix_dim_size, split_dim_size, suffix_dim_size) =
-        Base::SetDims(input_shape, split_dim);
+        Base::template SetDims<int32>(input_shape, split_dim);
 
     const int32 split_dim_output_size = split_dim_size / num_split;
     TensorShape output_shape(input_shape);
     output_shape.set_dim(split_dim, split_dim_output_size);
 
-    AllocatorAttributes attr;
-    attr.set_on_host(true);
-    attr.set_gpu_compatible(true);
+    GpuDeviceArrayOnHost<T*> ptrs(context, num_split);
+    OP_REQUIRES_OK(context, ptrs.Init());
 
-    Tensor output_ptrs_on_host;
-    Tensor output_ptrs_on_gpu;
-    int64 output_ptrs_total_bytes = static_cast<int64>(sizeof(T*) * num_split);
-    OP_REQUIRES_OK(context, context->allocate_temp(
-                                DT_INT8, TensorShape{output_ptrs_total_bytes},
-                                &output_ptrs_on_host, attr));
-    OP_REQUIRES_OK(context, context->allocate_temp(
-                                DT_INT8, TensorShape{output_ptrs_total_bytes},
-                                &output_ptrs_on_gpu));
-    T** output_ptrs_on_host_arr =
-        reinterpret_cast<T**>(output_ptrs_on_host.flat<int8>().data());
     for (int i = 0; i < num_split; ++i) {
       Tensor* result = nullptr;
       OP_REQUIRES_OK(context,
                      context->allocate_output(i, output_shape, &result));
-      output_ptrs_on_host_arr[i] = result->flat<T>().data();
+      ptrs.Set(i, result->flat<T>().data());
     }
     if (prefix_dim_size * split_dim_output_size * suffix_dim_size == 0) {
       return;
     }
-    auto stream = context->op_device_context()->stream();
-    perftools::gputools::DeviceMemoryBase output_ptrs_base{
-        output_ptrs_on_gpu.flat<int8>().data(), static_cast<uint64>(num_split)};
-    TensorReference tensor_ref(output_ptrs_on_host);
-    stream->ThenMemcpy(&output_ptrs_base,
-                       output_ptrs_on_host.flat<int8>().data(),
-                       output_ptrs_total_bytes);
-    context->device()->tensorflow_gpu_device_info()->event_mgr->ThenExecute(
-        stream, [tensor_ref]() { tensor_ref.Unref(); });
-    SplitOpGPULaunch<T>().Run(
-        context->eigen_device<GPUDevice>(), input.flat<T>().data(), num_split,
-        prefix_dim_size, split_dim_size, suffix_dim_size,
-        reinterpret_cast<T**>(output_ptrs_on_gpu.flat<int8>().data()));
-    OP_REQUIRES(context, stream->ok(),
+    OP_REQUIRES_OK(context, ptrs.Finalize());
+
+    SplitOpGPULaunch<T>().Run(context->eigen_device<GPUDevice>(),
+                              input.flat<T>().data(), prefix_dim_size,
+                              split_dim_size, suffix_dim_size, ptrs.data());
+    OP_REQUIRES(context, context->op_device_context()->stream()->ok(),
                 errors::Internal("Launch of gpu kernel for SplitOp failed"));
   }
 };
-#endif  // GOOGLE_CUDA
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+
 
 #define REGISTER_SPLIT(type)                             \
   REGISTER_KERNEL_BUILDER(Name("Split")                  \
@@ -252,10 +331,11 @@ class SplitOpGPU : public SplitOpBase<GPUDevice, T> {
                           SplitOpCPU<type>)
 
 TF_CALL_ALL_TYPES(REGISTER_SPLIT);
+REGISTER_SPLIT(quint8);
 
 #undef REGISTER_SPLIT
 
-#if GOOGLE_CUDA
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
 #define REGISTER_GPU(type)                               \
   REGISTER_KERNEL_BUILDER(Name("Split")                  \
@@ -264,9 +344,12 @@ TF_CALL_ALL_TYPES(REGISTER_SPLIT);
                               .HostMemory("split_dim"),  \
                           SplitOpGPU<type>)
 
+TF_CALL_bfloat16(REGISTER_GPU);
 TF_CALL_GPU_NUMBER_TYPES(REGISTER_GPU);
+TF_CALL_COMPLEX_TYPES(REGISTER_GPU);
 #undef REGISTER_GPU
 
-#endif  // GOOGLE_CUDA
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+
 
 }  // end namespace tensorflow

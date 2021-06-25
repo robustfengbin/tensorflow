@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -68,19 +68,22 @@ static Graph* SparseTensorDenseMatmul(int nnz, int m, int k, int n,
   return g;
 }
 
+// NOLINTBEGIN
 #define BM_SparseTensorDenseMatmulDev(NNZ, M, K, N, TA, TB, DEVICE)                  \
   static void                                                                        \
       BM_SparseTensorDenseMatmul##_##NNZ##_##M##_##K##_##N##_##TA##_##TB##_##DEVICE( \
-          int iters) {                                                               \
+          ::testing::benchmark::State& state) {                                      \
     int64 items_per_iter = (static_cast<int64>(NNZ) * (TB ? K : N));                 \
-    testing::ItemsProcessed(static_cast<int64>(iters) * items_per_iter);             \
-    testing::BytesProcessed(static_cast<int64>(iters) * items_per_iter *             \
+    test::Benchmark(#DEVICE, SparseTensorDenseMatmul(NNZ, M, K, N, TA, TB),          \
+                    /*old_benchmark_api*/ false)                                     \
+        .Run(state);                                                                 \
+    state.SetItemsProcessed(state.iterations() * items_per_iter);                    \
+    state.SetBytesProcessed(state.iterations() * items_per_iter *                    \
                             sizeof(float));                                          \
-    test::Benchmark(#DEVICE, SparseTensorDenseMatmul(NNZ, M, K, N, TA, TB))          \
-        .Run(iters);                                                                 \
   }                                                                                  \
   BENCHMARK(                                                                         \
       BM_SparseTensorDenseMatmul##_##NNZ##_##M##_##K##_##N##_##TA##_##TB##_##DEVICE);
+// NOLINTEND
 
 #define BM_SparseTensorDenseMatmul(NNZ, M, K, N, TA, TB)    \
   BM_SparseTensorDenseMatmulDev(NNZ, M, K, N, TA, TB, cpu); \

@@ -1,4 +1,4 @@
-/* Copyright 2016 Google Inc. All Rights Reserved.
+/* Copyright 2016 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -31,10 +31,11 @@ namespace tensorflow {
 // device status attributes.
 class WorkerCachePartial : public WorkerCacheInterface {
  public:
-  bool GetDeviceBusNonBlocking(const string& device, BusAdjacency* ba) override;
+  bool GetDeviceLocalityNonBlocking(const string& device,
+                                    DeviceLocality* locality) override;
 
-  void GetDeviceBusAsync(const string& device, BusAdjacency* ba,
-                         StatusCallback) override;
+  void GetDeviceLocalityAsync(const string& device, DeviceLocality* locality,
+                              StatusCallback) override;
 
   ~WorkerCachePartial() override {}
 
@@ -49,7 +50,7 @@ class WorkerCachePartial : public WorkerCacheInterface {
   Status RefreshDeviceStatus(const string& device_name);
 
   typedef std::unordered_map<string, DeviceAttributes> StatusMap;
-  StatusMap device_status_cache_ GUARDED_BY(mu_);
+  StatusMap device_status_cache_ TF_GUARDED_BY(mu_);
 };
 
 }  // namespace tensorflow

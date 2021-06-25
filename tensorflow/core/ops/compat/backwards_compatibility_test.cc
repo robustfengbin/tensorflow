@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,12 +19,15 @@ limitations under the License.
 #include "tensorflow/core/platform/env.h"
 #include "tensorflow/core/platform/protobuf.h"
 #include "tensorflow/core/platform/test.h"
+#include "tensorflow/core/public/version.h"
 
 namespace tensorflow {
 namespace {
 
 TEST(BackwardsCompatibilityTest, IsCompatible) {
-  OpCompatibilityLib compatibility("tensorflow/core/ops");
+  OpCompatibilityLib compatibility("tensorflow/core/ops",
+                                   strings::StrCat("v", TF_MAJOR_VERSION),
+                                   nullptr);
 
   Env* env = Env::Default();
   int changed_ops = 0;

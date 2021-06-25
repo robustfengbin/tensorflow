@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,6 +14,10 @@ limitations under the License.
 ==============================================================================*/
 
 #include "tensorflow/core/platform/logging.h"
+
+#include <sstream>
+#include <vector>
+
 #include "tensorflow/core/platform/test.h"
 
 namespace tensorflow {
@@ -24,6 +28,8 @@ TEST(Logging, Log) {
   LOG(ERROR) << "Error message";
   VLOG(1) << "A VLOG message";
   VLOG(2) << "A higher VLOG message";
+  DVLOG(1) << "A DVLOG message";
+  DVLOG(2) << "A higher DVLOG message";
 }
 
 TEST(Logging, CheckChecks) {
@@ -86,6 +92,41 @@ TEST(LoggingDeathTest, FailedChecks) {
   ASSERT_DEATH(DCHECK_LT(3, 2), "3 < 2");
   ASSERT_DEATH(DCHECK_LE(3, 2), "3 <= 2");
 #endif
+}
+
+TEST(InternalLogString, Basic) {
+  // Just make sure that this code compiles (we don't actually verify
+  // the output)
+  internal::LogString(__FILE__, __LINE__, INFO, "Hello there");
+}
+
+class TestSink : public TFLogSink {
+ public:
+  void Send(const TFLogEntry& entry) override {
+    ss_ << entry.text_message() << std::endl;
+  }
+
+  std::string Get() const { return ss_.str(); }
+
+ private:
+  std::stringstream ss_;
+};
+
+TEST(LogSinkTest, testLogSinks) {
+  const int sinks_initial_size = TFGetLogSinks().size();
+  TestSink sink;
+
+  TFAddLogSink(&sink);
+
+  EXPECT_EQ(TFGetLogSinks().size(), sinks_initial_size + 1);
+
+  LOG(INFO) << "Foo";
+  LOG(INFO) << "Bar";
+  EXPECT_EQ(sink.Get(), "Foo\nBar\n");
+
+  TFRemoveLogSink(&sink);
+
+  EXPECT_EQ(TFGetLogSinks().size(), sinks_initial_size);
 }
 
 }  // namespace tensorflow
