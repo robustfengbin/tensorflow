@@ -1,4 +1,4 @@
-/* Copyright 2016 Google Inc. All Rights Reserved.
+/* Copyright 2016 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,11 +16,16 @@ limitations under the License.
 #include "tensorflow/core/kernels/cwise_ops_common.h"
 
 namespace tensorflow {
-REGISTER4(BinaryOp, CPU, "SquaredDifference", functor::squared_difference,
-          float, double, int32, int64);
-#if GOOGLE_CUDA
-REGISTER3(BinaryOp, GPU, "SquaredDifference", functor::squared_difference,
-          float, double, int64);
+REGISTER8(BinaryOp, CPU, "SquaredDifference", functor::squared_difference,
+          float, Eigen::half, double, bfloat16, int32_t, int64_t, complex64,
+          complex128);
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+#if !defined(MLIR_GENERATED_GPU_KERNELS_ENABLED)
+REGISTER4(BinaryOp, GPU, "SquaredDifference", functor::squared_difference,
+          float, Eigen::half, double, int64);
+#endif
+REGISTER(BinaryOp, GPU, "SquaredDifference", functor::squared_difference,
+         bfloat16);
 #endif
 
 // A special GPU kernel for int32.
@@ -32,7 +37,16 @@ REGISTER_KERNEL_BUILDER(
         .HostMemory("x")
         .HostMemory("y")
         .HostMemory("z")
-        .TypeConstraint<int32>("T"),
-    BinaryOp<CPUDevice, functor::squared_difference<int32>>);
+        .TypeConstraint<int32_t>("T"),
+    BinaryOp<CPUDevice, functor::squared_difference<int32_t>>);
+
+REGISTER_KERNEL_BUILDER(
+    Name("SquaredDifference")
+        .Device(DEVICE_DEFAULT)
+        .HostMemory("x")
+        .HostMemory("y")
+        .HostMemory("z")
+        .TypeConstraint<int32_t>("T"),
+    BinaryOp<CPUDevice, functor::squared_difference<int32_t>>);
 
 }  // namespace tensorflow

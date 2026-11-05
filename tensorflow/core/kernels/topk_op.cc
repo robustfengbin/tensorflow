@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,23 +17,43 @@ limitations under the License.
 
 #define EIGEN_USE_THREADS
 
+#include "tensorflow/core/kernels/topk_op.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <numeric>
 #include <vector>
-#include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
+
+#include "unsupported/Eigen/CXX11/Tensor"  // from @eigen_archive
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/tensor_shape.h"
+#include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/gtl/top_n.h"
+#include "tensorflow/core/platform/macros.h"  // NOLINT(misc-include-cleaner)
+#include "tensorflow/core/util/work_sharder.h"
 
 namespace tensorflow {
 
-template <typename T>
+typedef Eigen::ThreadPoolDevice CPUDevice;
+typedef Eigen::GpuDevice GPUDevice;
+
+template <typename Device, typename T, typename Tidx>
 class TopK : public OpKernel {
  public:
   explicit TopK(OpKernelConstruction* context) : OpKernel(context) {
-    OP_REQUIRES_OK(context, context->GetAttr("sorted", &sorted_));
+    // Allow "sorted" to be an optional attribute for use with ApproxTopK
+    // which has no such attribute.
+    auto status = context->GetAttr("sorted", &sorted_);
+    if (!status.ok()) {
+      sorted_ = true;  // Default to sorted, as required by ApproxTopK.
+    }
+
     if (num_inputs() < 2) {  // k is an attr (TopK).
-      OP_DEPRECATED(context, 7, "Use TopKV2 instead");
       OP_REQUIRES_OK(context, context->GetAttr("k", &k_));
     } else {  // k is an input (TopKV2), so we won't know it until Compute.
       k_ = -1;
@@ -44,24 +64,52 @@ class TopK : public OpKernel {
     int k = k_;
     if (num_inputs() >= 2) {
       const auto& k_in = context->input(1);
-      OP_REQUIRES(context, TensorShapeUtils::IsScalar(k_in.shape()),
-                  errors::InvalidArgument("k must be scalar, got shape ",
-                                          k_in.shape().DebugString()));
-      k = k_in.scalar<int32>()();
+      OP_REQUIRES(
+          context, TensorShapeUtils::IsScalar(k_in.shape()),
+          absl::InvalidArgumentError(absl::StrCat(
+              "k must be scalar, got shape ", k_in.shape().DebugString())));
+      switch (k_in.dtype()) {
+        case DT_INT16:
+          k = k_in.scalar<int16_t>()();
+          break;
+        case DT_INT32:
+          k = k_in.scalar<int32_t>()();
+          break;
+        case DT_INT64:
+          k = k_in.scalar<int64_t>()();
+          break;
+        default:
+          OP_REQUIRES(context, false,
+                      absl::InvalidArgumentError(absl::StrCat(
+                          "k must have dtype in {int16, int32, int64}, got  ",
+                          k_in.dtype())));
+      }
     }
-    OP_REQUIRES(context, k >= 0,
-                errors::InvalidArgument("Need k >= 0, got ", k));
+    OP_REQUIRES(
+        context, k >= 0,
+        absl::InvalidArgumentError(absl::StrCat("Need k >= 0, got ", k)));
     const auto& input_in = context->input(0);
     OP_REQUIRES(context, input_in.dims() >= 1,
-                errors::InvalidArgument("input must be >= 1-D, got shape ",
-                                        input_in.shape().DebugString()));
+                absl::InvalidArgumentError(
+                    absl::StrCat("input must be >= 1-D, got shape ",
+                                 input_in.shape().DebugString())));
     OP_REQUIRES(context, input_in.dim_size(input_in.dims() - 1) >= k,
-                errors::InvalidArgument("input must have at least k columns"));
+                absl::InvalidArgumentError(absl::StrCat(
+                    "input must have at least k columns. Had ",
+                    input_in.dim_size(input_in.dims() - 1), ", needed ", k)));
 
     const auto& input = input_in.flat_inner_dims<T>();
 
-    const auto num_rows = input.dimension(0);  // generally batch_size
-    const auto num_cols = input.dimension(1);
+    const int64_t num_rows = input.dimension(0);  // generally batch_size
+    const int64_t num_cols = input.dimension(1);
+    OP_REQUIRES(context, num_rows <= std::numeric_limits<Tidx>::max(),
+                errors::InvalidArgument(
+                    "First dimension of flattened input must be <= ",
+                    std::numeric_limits<Tidx>::max(), ", got ", num_rows));
+    OP_REQUIRES(context, num_cols <= std::numeric_limits<Tidx>::max(),
+                errors::InvalidArgument(
+                    "Second dimension of flattened input must be <= ",
+                    std::numeric_limits<Tidx>::max(), ", got ", num_cols));
 
     TensorShape output_shape = input_in.shape();
     output_shape.set_dim(input_in.dims() - 1, k);
@@ -72,37 +120,14 @@ class TopK : public OpKernel {
     OP_REQUIRES_OK(context,
                    context->allocate_output(1, output_shape, &indices_out));
 
-    // Nothing to do for top-nothing.
-    if (k == 0) return;
+    // Nothing to do for top-nothing or over nothing.
+    if (k == 0 || num_rows == 0) return;
 
     auto values = values_out->flat_inner_dims<T>();
-    auto indices = indices_out->flat_inner_dims<int32>();
-    gtl::TopN<std::pair<T, int32>> filter(k);
-    for (int r = 0; r < num_rows; r++) {
-      for (int32 c = 0; c < num_cols; ++c) {
-        // The second element is the negated index, so that lower-index elements
-        // are considered larger than higher-index elements in case of ties.
-        filter.push(std::make_pair(input(r, c), -c));
-      }
-
-      int32 i = 0;
-      if (sorted_ && k > 1) {
-        std::unique_ptr<std::vector<std::pair<T, int32>>> top_k(
-            filter.Extract());
-        for (auto top_k_it = top_k->begin(); top_k_it != top_k->end();
-             ++top_k_it, ++i) {
-          values(r, i) = top_k_it->first;
-          indices(r, i) = -top_k_it->second;
-        }
-      } else {
-        for (auto top_k_it = filter.unsorted_begin();
-             top_k_it != filter.unsorted_end(); ++top_k_it, ++i) {
-          values(r, i) = top_k_it->first;
-          indices(r, i) = -top_k_it->second;
-        }
-      }
-      filter.Reset();
-    }
+    auto indices = indices_out->flat_inner_dims<Tidx>();
+    absl::Status s = functor::TopKFunctor<Device, T, Tidx>::Compute(
+        context, sorted_, k, input, num_rows, num_cols, values, indices);
+    OP_REQUIRES_OK(context, s);
   }
 
  private:
@@ -110,16 +135,279 @@ class TopK : public OpKernel {
   bool sorted_;
 };
 
-#define REGISTER_KERNELS_NAME(name, type) \
-  REGISTER_KERNEL_BUILDER(                \
-      Name(#name).Device(DEVICE_CPU).TypeConstraint<type>("T"), TopK<type>)
+namespace functor {
 
-#define REGISTER_KERNELS(type)       \
-  REGISTER_KERNELS_NAME(TopK, type); \
-  REGISTER_KERNELS_NAME(TopKV2, type)
+namespace {
+
+// Returns +1 for +NaN, -1 for -NaN, and 0 for any other value. Ordering by
+// value and then by this rank gives +NaN > +Inf > ... > -Inf > -NaN, which
+// matches the GPU radix-sort key order and the XLA total order for NaNs.
+// +0.0 and -0.0 compare equal and are ordered by index.
+template <typename T>
+EIGEN_ALWAYS_INLINE int NanRank(const T v) {  // NOLINT(misc-include-cleaner)
+  // NOLINTNEXTLINE(misc-include-cleaner)
+  if (TF_PREDICT_TRUE(!Eigen::numext::isnan(v))) return 0;
+  // Eigen::numext::signbit returns a Scalar bit mask (all ones, itself a NaN
+  // for floating types), not a bool, so test the sign with std::signbit. The
+  // conversion to double preserves the sign bit of a NaN for every float type.
+  return std::signbit(static_cast<double>(v)) ? -1 : 1;
+}
+
+}  // namespace
+
+template <typename T, typename Tidx>
+struct TopKFunctor<CPUDevice, T, Tidx> {
+  static EIGEN_ALWAYS_INLINE absl::Status Compute(
+      OpKernelContext* context, bool sorted, int k,
+      const typename TTypes<T, 2>::ConstTensor& input, const int64_t num_rows,
+      const int64_t num_cols, typename TTypes<T, 2>::Tensor values,
+      typename TTypes<Tidx, 2>::Tensor indices) {
+    auto SortIndices = [&](int64_t start_batch, int64_t limit_batch) {
+      for (int64_t b = start_batch; b < limit_batch; ++b) {
+        const T* input_data = &input(b, 0);
+        // Both comparators order values descending with the relational
+        // comparisons first (the common path). Equal values (never NaN, and
+        // including +0/-0) tie; only a NaN operand falls back to the NaN rank,
+        // so NaNs are ordered +NaN first and -NaN last.
+        const auto stable_comp = [input_data](const Tidx a, const Tidx b) {
+          const T val_a = input_data[a];
+          const T val_b = input_data[b];
+          if (val_b < val_a) {
+            return true;
+          }
+          if (val_a < val_b) {
+            return false;
+          }
+          if (val_a == val_b) {
+            return a < b;
+          }
+          if constexpr (!Eigen::NumTraits<T>::IsInteger) {
+            const int rank_a = NanRank(val_a);
+            const int rank_b = NanRank(val_b);
+            if (rank_a != rank_b) {
+              return rank_b < rank_a;
+            }
+          }
+          return a < b;
+        };
+        const auto comp = [input_data](const Tidx a, const Tidx b) {
+          const T val_a = input_data[a];
+          const T val_b = input_data[b];
+          if (val_b < val_a) {
+            return true;
+          }
+          if (val_a < val_b) {
+            return false;
+          }
+          if (val_a == val_b) {
+            return false;
+          }
+          if constexpr (!Eigen::NumTraits<T>::IsInteger) {
+            return NanRank(val_b) < NanRank(val_a);
+          } else {
+            return false;
+          }
+        };
+        // TODO(ebrevdo): For large k < num_cols, instead of using
+        // TopN, it may be faster to create a temporary vector of
+        // values 0..num_cols - 1 and then use std::partial_sort_copy
+        // of this into indices. Choosing the appropriate minimum k or
+        // ratio of k/num_cols will require some experimentation.
+        if (k == num_cols) {
+          auto* begin = &indices(b, 0);
+          auto* end = &indices(b, k);
+          // Set the initial array of indices 0 ... k - 1.
+          std::iota(begin, end, 0);
+          // We want an in-place sort, but we can cheat because we're sorting
+          // indices that started out sorted.  First, do a std::sort, which
+          // is notably faster than std::stable_sort.
+          std::sort(begin, end, comp);
+          // Then, for runs of adjacent elements that are equivalent under
+          // `comp` (equal values, or NaNs of the same sign), sort the indices
+          // in those runs in increasing order.
+          for (auto* run_begin = begin; run_begin != end;) {
+            auto* run_end = run_begin + 1;
+            while (run_end != end && !comp(*run_begin, *run_end)) ++run_end;
+            if (run_end - run_begin > 1) std::sort(run_begin, run_end);
+            run_begin = run_end;
+          }
+        } else if (k == 1) {
+          // A single scan instead of an Eigen `maximum` reduction: the NaN
+          // propagation of the reduction is unspecified, and locating its
+          // result by equality can never find a NaN. Returns the first +NaN
+          // if any, else the first maximum non-NaN value, else the first -NaN.
+          Tidx best_c = 0;
+          T best_val = input_data[0];
+          Tidx first_c = 1;
+          if constexpr (!Eigen::NumTraits<T>::IsInteger) {
+            // A leading +NaN is the maximum: skip the scan.
+            if (NanRank(best_val) > 0) first_c = static_cast<Tidx>(num_cols);
+          }
+          for (Tidx c = first_c; c < num_cols; ++c) {
+            const T val = input_data[c];
+            // '<=' is false only if val > best_val or either operand is NaN.
+            if (val <= best_val) continue;
+            if (best_val < val) {
+              best_val = val;
+              best_c = c;
+              continue;
+            }
+            if constexpr (!Eigen::NumTraits<T>::IsInteger) {
+              const int rank = NanRank(val);
+              if (rank > 0) {  // +NaN: the global maximum, stop.
+                best_c = c;
+                break;
+              }
+              if (rank == 0) {  // best_val is -NaN; any non-NaN beats it.
+                best_val = val;
+                best_c = c;
+              }
+              // rank < 0: a -NaN never beats the current best.
+            }
+          }
+          indices(b, 0) = best_c;
+        } else {
+          // Use the TopN heap object to sort.
+          gtl::TopN<Tidx, decltype(stable_comp)> filter(k, stable_comp);
+          filter.reserve(num_cols);
+          for (Tidx c = 0; c < num_cols; ++c) {
+            filter.push(c);
+          }
+
+          Tidx i = 0;
+          if (sorted) {
+            std::unique_ptr<std::vector<Tidx>> top_k(filter.Extract());
+            for (auto top_k_it = top_k->begin(); top_k_it != top_k->end();
+                 ++top_k_it, ++i) {
+              indices(b, i) = *top_k_it;
+            }
+          } else {
+            for (auto top_k_it = filter.unsorted_begin();
+                 top_k_it != filter.unsorted_end(); ++top_k_it, ++i) {
+              indices(b, i) = *top_k_it;
+            }
+          }
+        }
+        // Now that the indices are sorted, copy the values over in
+        // sorted order.
+        std::transform(&indices(b, 0), &indices(b, k), &values(b, 0),
+                       [b, &input](const Tidx loc) { return input(b, loc); });
+      }  // for (Tidx b = ...
+    };
+
+    // Guesstimate of cost; 4*N*log(K) where N == num_cols.
+    // If K == N, assume the cost is N*log(K + 1).
+    const double cmp_cost = 3 * Eigen::TensorOpCost::AddCost<Tidx>() +
+                            Eigen::TensorOpCost::AddCost<T>();
+    const double base_cost =
+        cmp_cost *
+        static_cast<double>(num_cols *
+                            Eigen::numext::log2(static_cast<float>(k + 1)));
+    const double sort_cost = (k == num_cols) ? base_cost : 4 * base_cost;
+    const double copy_cost = 2 * k * Eigen::TensorOpCost::AddCost<T>();
+    const double total_cost = sort_cost + copy_cost;
+    const int64_t final_cost =
+        (total_cost >= static_cast<double>(std::numeric_limits<int64_t>::max()))
+            ? std::numeric_limits<int64_t>::max()
+            : static_cast<int64_t>(total_cost);
+    auto worker_threads = *(context->device()->tensorflow_cpu_worker_threads());
+    Shard(worker_threads.num_threads, worker_threads.workers, num_rows,
+          final_cost, SortIndices);
+
+    return absl::OkStatus();
+  }
+};
+
+}  // namespace functor
+
+#define REGISTER_KERNELS_NAME(name, type, index_type)                    \
+  REGISTER_KERNEL_BUILDER(Name(#name)                                    \
+                              .Device(DEVICE_CPU)                        \
+                              .TypeConstraint<type>("T")                 \
+                              .TypeConstraint<index_type>("index_type"), \
+                          TopK<CPUDevice, type, index_type>)
+
+#define REGISTER_KERNELS_WITH_INDEX(type, index_type) \
+  REGISTER_KERNELS_NAME(TopK, type, index_type);      \
+  REGISTER_KERNELS_NAME(TopKV2, type, index_type);
+
+#define REGISTER_APPROX_TOPK_KERNELS(type)                    \
+  REGISTER_KERNEL_BUILDER(                                    \
+      Name("ApproxTopK")                                      \
+          .Device(DEVICE_CPU)                                 \
+          .TypeConstraint<type>("T")                          \
+          .AttrConstraint<int64_t>("reduction_dimension", -1) \
+          .AttrConstraint<bool>("is_max_k", true),            \
+      TopK<CPUDevice, type, int32>);
+
+#define REGISTER_KERNELS(type)                \
+  REGISTER_KERNELS_WITH_INDEX(type, int16);   \
+  REGISTER_KERNELS_WITH_INDEX(type, int32);   \
+  REGISTER_KERNELS_WITH_INDEX(type, int64_t); \
+  REGISTER_APPROX_TOPK_KERNELS(type);
 
 TF_CALL_REAL_NUMBER_TYPES(REGISTER_KERNELS);
-#undef REGISTER_KERNELS_TO_NAME
+
+#undef REGISTER_TOPK_KERNELS_NAME
+#undef REGISTER_TOPK_KERNELS_WITH_INDEX
+#undef REGISTER_APPROX_TOPK_KERNELS
 #undef REGISTER_KERNELS
 
-}  // namespace tensorflow
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+
+namespace functor {
+#define DECLARE_GPU_SPEC_WITH_INDEX(T, Tidx)                                   \
+  template <>                                                                  \
+  Status TopKFunctor<GPUDevice, T, Tidx>::Compute(                             \
+      OpKernelContext* context, bool sorted, int k,                            \
+      const typename TTypes<T, 2>::ConstTensor& input, const int64_t num_rows, \
+      const int64_t num_cols, typename TTypes<T, 2>::Tensor values,            \
+      typename TTypes<Tidx, 2>::Tensor indices);                               \
+  extern template struct functor::TopKFunctor<GPUDevice, T, Tidx>;
+
+#define DECLARE_GPU_SPEC(T) DECLARE_GPU_SPEC_WITH_INDEX(T, int32)
+
+TF_CALL_GPU_NUMBER_TYPES(DECLARE_GPU_SPEC);
+TF_CALL_INTEGRAL_TYPES(DECLARE_GPU_SPEC);
+
+#undef DECLARE_GPU_SPEC
+#undef DECLARE_GPU_SPEC_WITH_INDEX
+
+}  // namespace functor
+
+#define REGISTER_TOPK_KERNELS_WITH_INDEX(type, index_type)               \
+  REGISTER_KERNEL_BUILDER(Name("TopK")                                   \
+                              .Device(DEVICE_GPU)                        \
+                              .TypeConstraint<type>("T")                 \
+                              .TypeConstraint<index_type>("index_type"), \
+                          TopK<GPUDevice, type, index_type>);            \
+  REGISTER_KERNEL_BUILDER(Name("TopKV2")                                 \
+                              .Device(DEVICE_GPU)                        \
+                              .TypeConstraint<type>("T")                 \
+                              .TypeConstraint<index_type>("index_type")  \
+                              .HostMemory("k"),                          \
+                          TopK<GPUDevice, type, index_type>)
+
+#define REGISTER_APPROX_TOPK_KERNELS(type)                    \
+  REGISTER_KERNEL_BUILDER(                                    \
+      Name("ApproxTopK")                                      \
+          .Device(DEVICE_GPU)                                 \
+          .TypeConstraint<type>("T")                          \
+          .AttrConstraint<int64_t>("reduction_dimension", -1) \
+          .AttrConstraint<bool>("is_max_k", true),            \
+      TopK<GPUDevice, type, int32>);
+
+#define REGISTER_TOPK_KERNELS(type) \
+  REGISTER_TOPK_KERNELS_WITH_INDEX(type, int32)
+
+TF_CALL_GPU_NUMBER_TYPES(REGISTER_TOPK_KERNELS);
+TF_CALL_INTEGRAL_TYPES(REGISTER_TOPK_KERNELS);
+TF_CALL_GPU_NUMBER_TYPES(REGISTER_APPROX_TOPK_KERNELS);
+
+#undef REGISTER_TOPK_KERNELS
+#undef REGISTER_TOPK_KERNELS_WITH_INDEX
+#undef REGISTER_APPROX_TOPK_KERNELS
+
+#endif  // end GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+
+}  // end namespace tensorflow

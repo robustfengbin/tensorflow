@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,10 +15,24 @@ limitations under the License.
 
 #include "tensorflow/core/kernels/cwise_ops_common.h"
 
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+#include "tensorflow/core/kernels/integer_pow_gpu.h"
+#endif
+
 namespace tensorflow {
-REGISTER5(BinaryOp, CPU, "Pow", functor::pow, float, double, int32, int64,
-          complex64);
-#if GOOGLE_CUDA
-REGISTER3(BinaryOp, GPU, "Pow", functor::pow, float, double, int64);
+REGISTER6(BinaryOp, CPU, "Pow", functor::pow, float, Eigen::half, bfloat16,
+          double, complex64, complex128);
+REGISTER4(BinaryOp, CPU, "Pow", functor::safe_pow, int8_t, int16_t, int32_t,
+          int64_t);
+
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+#if !defined(MLIR_GENERATED_GPU_KERNELS_ENABLED)
+REGISTER3(BinaryOp, GPU, "Pow", functor::pow, float, Eigen::half, double);
+using Int64GpuPowOp = IntegerPowGpuOp<
+    int64_t, BinaryOp<GPUDevice, functor::safe_pow_ignore_error<int64_t>>>;
+REGISTER_KERNEL_BUILDER(
+    Name("Pow").Device(DEVICE_GPU).TypeConstraint<int64_t>("T"), Int64GpuPowOp);
+#endif
+REGISTER(BinaryOp, GPU, "Pow", functor::pow, bfloat16);
 #endif
 }  // namespace tensorflow

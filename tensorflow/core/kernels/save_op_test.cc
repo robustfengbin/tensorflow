@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,20 +16,27 @@ limitations under the License.
 #include <functional>
 #include <memory>
 
+#include "tensorflow/cc/ops/const_op.h"
+#include "tensorflow/cc/ops/io_ops.h"
+#include "tensorflow/core/common_runtime/kernel_benchmark_testlib.h"
 #include "tensorflow/core/framework/allocator.h"
 #include "tensorflow/core/framework/fake_input.h"
-#include "tensorflow/core/framework/graph.pb.h"
 #include "tensorflow/core/framework/node_def_builder.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/framework/types.pb.h"
+#include "tensorflow/core/graph/graph_def_builder.h"
 #include "tensorflow/core/kernels/ops_testutil.h"
 #include "tensorflow/core/kernels/ops_util.h"
+#include "tensorflow/core/lib/core/status_test_util.h"
 #include "tensorflow/core/lib/io/path.h"
 #include "tensorflow/core/lib/strings/strcat.h"
 #include "tensorflow/core/platform/test.h"
+#include "tensorflow/core/platform/test_benchmark.h"
 #include "tensorflow/core/platform/types.h"
+#include "tensorflow/core/protobuf/config.pb.h"
+#include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/util/tensor_slice_reader.h"
 
 namespace tensorflow {
@@ -44,33 +51,35 @@ class SaveOpTest : public OpsTestBase {
             .Input(FakeInput())
             .Input(FakeInput({DT_BOOL, DT_INT32, DT_FLOAT, DT_DOUBLE, DT_QINT8,
                               DT_QINT32, DT_UINT8, DT_INT8, DT_INT16, DT_INT64,
-                              DT_STRING, DT_COMPLEX64}))
+                              DT_STRING, DT_COMPLEX64, DT_COMPLEX128, DT_HALF}))
             .Finalize(node_def()));
     TF_ASSERT_OK(InitOp());
   }
 };
 
 TEST_F(SaveOpTest, Simple) {
-  const string filename = io::JoinPath(testing::TmpDir(), "tensor_simple");
-  const string tensornames[] = {
-      "tensor_bool",  "tensor_int",    "tensor_float",  "tensor_double",
-      "tensor_qint8", "tensor_qint32", "tensor_uint8",  "tensor_int8",
-      "tensor_int16", "tensor_int64",  "tensor_string", "tensor_complex64"};
+  const std::string filename = io::JoinPath(testing::TmpDir(), "tensor_simple");
+  const std::string tensornames[] = {
+      "tensor_bool",       "tensor_int",    "tensor_float",  "tensor_double",
+      "tensor_qint8",      "tensor_qint32", "tensor_uint8",  "tensor_int8",
+      "tensor_int16",      "tensor_int64",  "tensor_string", "tensor_complex64",
+      "tensor_complex128", "tensor_half"};
 
   MakeOp();
   // Add a file name
-  AddInput<string>(TensorShape({}),
-                   [&filename](int x) -> string { return filename; });
+  AddInput<tstring>(TensorShape({}),
+                    [&filename](int x) -> tstring { return filename; });
 
   // Add the tensor names
-  AddInput<string>(TensorShape({12}),
-                   [&tensornames](int x) -> string { return tensornames[x]; });
+  AddInput<tstring>(TensorShape({14}), [&tensornames](int x) -> tstring {
+    return tensornames[x];
+  });
 
   // Add a 1-d bool tensor
   AddInput<bool>(TensorShape({2}), [](int x) -> bool { return x != 0; });
 
   // Add a 1-d integer tensor
-  AddInput<int32>(TensorShape({10}), [](int x) -> int32 { return x + 1; });
+  AddInput<int32_t>(TensorShape({10}), [](int x) -> int32_t { return x + 1; });
 
   // Add a 2-d float tensor
   AddInput<float>(TensorShape({2, 4}),
@@ -90,26 +99,35 @@ TEST_F(SaveOpTest, Simple) {
   });
 
   // Add a 1-d uint8 tensor
-  AddInput<uint8>(TensorShape({11}), [](int x) -> uint8 { return x + 1; });
+  AddInput<uint8_t>(TensorShape({11}), [](int x) -> uint8_t { return x + 1; });
 
   // Add a 1-d int8 tensor
-  AddInput<int8>(TensorShape({7}), [](int x) -> int8 { return x - 7; });
+  AddInput<int8_t>(TensorShape({7}), [](int x) -> int8_t { return x - 7; });
 
   // Add a 1-d int16 tensor
-  AddInput<int16>(TensorShape({7}), [](int x) -> int16 { return x - 8; });
+  AddInput<int16_t>(TensorShape({7}), [](int x) -> int16_t { return x - 8; });
 
   // Add a 1-d int64 tensor
-  AddInput<int64>(TensorShape({9}), [](int x) -> int64 { return x - 9; });
+  AddInput<int64_t>(TensorShape({9}), [](int x) -> int64_t { return x - 9; });
 
   // Add a 1-d string tensor
-  AddInput<string>(TensorShape({2}),
-                   [](int x) -> string { return x ? "yes" : "no"; });
+  AddInput<tstring>(TensorShape({2}),
+                    [](int x) -> tstring { return x ? "yes" : "no"; });
 
   // Add a 2-d complex64 tensor
   AddInput<complex64>(TensorShape({2, 3}), [](int x) -> complex64 {
     return complex64(100 + x, 200 + x);
   });
 
+  // Add a 2-d complex128 tensor
+  AddInput<complex128>(TensorShape({2, 3}), [](int x) -> complex128 {
+    return complex128(100 + x, 200 + x);
+  });
+
+  // Add a 2-d half tensor
+  AddInput<Eigen::half>(TensorShape({2, 4}), [](int x) -> Eigen::half {
+    return static_cast<Eigen::half>(x) / Eigen::half(2);
+  });
   TF_ASSERT_OK(RunOpKernel());
 
   // Check that the checkpoint file is properly written
@@ -241,7 +259,7 @@ TEST_F(SaveOpTest, Simple) {
 
     // We expect the tensor value to be correct.
     TensorSlice s = TensorSlice::ParseOrDie("-");
-    uint8 data[11];
+    uint8_t data[11];
     EXPECT_TRUE(reader.CopySliceData("tensor_uint8", s, data));
     for (int i = 0; i < 11; ++i) {
       EXPECT_EQ(i + 1, data[i]);
@@ -259,7 +277,7 @@ TEST_F(SaveOpTest, Simple) {
 
     // We expect the tensor value to be correct.
     TensorSlice s = TensorSlice::ParseOrDie("-");
-    int8 data[7];
+    int8_t data[7];
     EXPECT_TRUE(reader.CopySliceData("tensor_int8", s, data));
     for (int i = 0; i < 7; ++i) {
       EXPECT_EQ(i - 7, data[i]);
@@ -277,7 +295,7 @@ TEST_F(SaveOpTest, Simple) {
 
     // We expect the tensor value to be correct.
     TensorSlice s = TensorSlice::ParseOrDie("-");
-    int16 data[7];
+    int16_t data[7];
     EXPECT_TRUE(reader.CopySliceData("tensor_int16", s, data));
     for (int i = 0; i < 7; ++i) {
       EXPECT_EQ(i - 8, data[i]);
@@ -295,7 +313,7 @@ TEST_F(SaveOpTest, Simple) {
 
     // We expect the tensor value to be correct.
     TensorSlice s = TensorSlice::ParseOrDie("-");
-    int64 data[9];
+    int64_t data[9];
     EXPECT_TRUE(reader.CopySliceData("tensor_int64", s, data));
     for (int i = 0; i < 9; ++i) {
       EXPECT_EQ(i - 9, data[i]);
@@ -313,7 +331,7 @@ TEST_F(SaveOpTest, Simple) {
 
     // We expect the tensor value to be correct.
     TensorSlice s = TensorSlice::ParseOrDie("-");
-    string data[2];
+    tstring data[2];
     EXPECT_TRUE(reader.CopySliceData("tensor_string", s, data));
     EXPECT_EQ("no", data[0]);
     EXPECT_EQ("yes", data[1]);
@@ -337,6 +355,43 @@ TEST_F(SaveOpTest, Simple) {
       EXPECT_EQ(200 + i, data[i].imag());
     }
   }
+
+  {
+    // The 2-d complex128 tensor
+    TensorShape shape;
+    DataType type;
+    EXPECT_TRUE(reader.HasTensor("tensor_complex128", &shape, &type));
+    TensorShape expected({2, 3});
+    EXPECT_TRUE(shape.IsSameSize(expected));
+    EXPECT_EQ(DT_COMPLEX128, type);
+
+    // We expect the tensor value to be correct.
+    TensorSlice s = TensorSlice::ParseOrDie("-:-");
+    complex128 data[6];
+    EXPECT_TRUE(reader.CopySliceData("tensor_complex128", s, data));
+    for (int i = 0; i < 6; ++i) {
+      EXPECT_EQ(100 + i, data[i].real());
+      EXPECT_EQ(200 + i, data[i].imag());
+    }
+  }
+  {
+    // The 2-d half tensor
+    TensorShape shape;
+    DataType type;
+    EXPECT_TRUE(reader.HasTensor("tensor_half", &shape, &type));
+    TensorShape expected({2, 4});
+    EXPECT_TRUE(shape.IsSameSize(expected));
+    EXPECT_EQ(DT_HALF, type);
+
+    // We expect the tensor value to be correct.
+    TensorSlice s = TensorSlice::ParseOrDie("-:-");
+    Eigen::half data[8];
+    std::fill_n(data, 8, Eigen::half(0));
+    EXPECT_TRUE(reader.CopySliceData("tensor_half", s, data));
+    for (int i = 0; i < 8; ++i) {
+      EXPECT_EQ(static_cast<Eigen::half>(i) / Eigen::half(2), data[i]);
+    }
+  }
 }
 
 class SaveSlicesOpTest : public OpsTestBase {
@@ -358,12 +413,13 @@ class SaveSlicesOpTest : public OpsTestBase {
 // right slices are actually restored so instead we just check that
 // CopySliceData() return true/false depending on the slice we ask for.
 TEST_F(SaveSlicesOpTest, Slices) {
-  const string filename = io::JoinPath(testing::TmpDir(), "tensor_slices");
-  const string tensornames[] = {"tensor_int", "tensor_float", "tensor_double",
-                                "tensor_qint8", "tensor_qint32"};
+  const std::string filename = io::JoinPath(testing::TmpDir(), "tensor_slices");
+  const std::string tensornames[] = {"tensor_int", "tensor_float",
+                                     "tensor_double", "tensor_qint8",
+                                     "tensor_qint32"};
   // Specifies that the data we save are slices of larger tensors.
   // See core/framework/tensor_slice.h for the slice syntax.
-  const string tensorshapes[] = {
+  const std::string tensorshapes[] = {
       "10 -",         // Full contents of a 10 element vector.
       "2 4 -:0,2",    // A 2x2 slice of a 2x4 tensor.
       "2 4 0,1:2,2",  // A 1x2 slice of a 2x4 tensor.
@@ -373,20 +429,21 @@ TEST_F(SaveSlicesOpTest, Slices) {
 
   MakeOp();
   // Add a file name
-  AddInput<string>(TensorShape({}),
-                   [&filename](int x) -> string { return filename; });
+  AddInput<tstring>(TensorShape({}),
+                    [&filename](int x) -> tstring { return filename; });
 
   // Add the tensor names
-  AddInput<string>(TensorShape({5}),
-                   [&tensornames](int x) -> string { return tensornames[x]; });
+  AddInput<tstring>(TensorShape({5}), [&tensornames](int x) -> tstring {
+    return tensornames[x];
+  });
 
   // Add the tensor shapes and slices
-  AddInput<string>(TensorShape({5}), [&tensorshapes](int x) -> string {
+  AddInput<tstring>(TensorShape({5}), [&tensorshapes](int x) -> tstring {
     return tensorshapes[x];
   });
 
   // Add a 1-d integer tensor
-  AddInput<int32>(TensorShape({10}), [](int x) -> int32 { return x + 1; });
+  AddInput<int32_t>(TensorShape({10}), [](int x) -> int32_t { return x + 1; });
 
   // Add a 2-d float tensor
   AddInput<float>(TensorShape({2, 2}),
@@ -512,11 +569,12 @@ class SaveOpSlices2Test : public OpsTestBase {
 };
 
 TEST_F(SaveOpSlices2Test, TwoSlices) {
-  const string filename = io::JoinPath(testing::TmpDir(), "three_slices");
+  const std::string filename = io::JoinPath(testing::TmpDir(), "three_slices");
   // We will save 2 slices of the tensor named "four_by_sixteen" which is 4x16,
   // and one slice of the "small" tensor.
-  const string tensornames[] = {"four_by_sixteen", "four_by_sixteen", "small"};
-  const string tensorshapes[] = {
+  const std::string tensornames[] = {"four_by_sixteen", "four_by_sixteen",
+                                     "small"};
+  const std::string tensorshapes[] = {
       // Slice specifications for the 2 slices of "four_by_sixteen"
       "4 16 0,2:-",  // 1st slice covers indices 0 and 1 in the first dim.
       "4 16 2,2:-",  // 2nd slice covers indices 2 and 3 in the first dim.
@@ -525,24 +583,26 @@ TEST_F(SaveOpSlices2Test, TwoSlices) {
 
   MakeOp();
   // Add a file name
-  AddInput<string>(TensorShape({}),
-                   [&filename](int x) -> string { return filename; });
+  AddInput<tstring>(TensorShape({}),
+                    [&filename](int x) -> tstring { return filename; });
 
   // Add the tensor names
-  AddInput<string>(TensorShape({3}),
-                   [&tensornames](int x) -> string { return tensornames[x]; });
+  AddInput<tstring>(TensorShape({3}), [&tensornames](int x) -> tstring {
+    return tensornames[x];
+  });
 
   // Add the tensor shapes and slices
-  AddInput<string>(TensorShape({3}), [&tensorshapes](int x) -> string {
+  AddInput<tstring>(TensorShape({3}), [&tensorshapes](int x) -> tstring {
     return tensorshapes[x];
   });
 
   // Add an integer tensor for slice 0,2:- of a 4x16 tensor: It is 2x16.
-  AddInput<int32>(TensorShape({2, 16}), [](int x) -> int32 { return x + 1; });
+  AddInput<int32_t>(TensorShape({2, 16}),
+                    [](int x) -> int32_t { return x + 1; });
 
   // Add an integer tensor for slice 2,2:- of a 4x16 tensor: It is 2x16.
-  AddInput<int32>(TensorShape({2, 16}),
-                  [](int x) -> int32 { return 10 * (x + 1); });
+  AddInput<int32_t>(TensorShape({2, 16}),
+                    [](int x) -> int32_t { return 10 * (x + 1); });
 
   // Add a float tensor for "small"
   AddInput<float>(TensorShape({2, 4}),
@@ -598,11 +658,45 @@ TEST_F(SaveOpSlices2Test, TwoSlices) {
     EXPECT_TRUE(reader.CopySliceData("small", TensorSlice(reloaded.dims()),
                                      reloaded.flat<float>().data()));
 
-    for (int64 i = 0; i < reloaded.NumElements(); ++i) {
+    for (int64_t i = 0; i < reloaded.NumElements(); ++i) {
       EXPECT_EQ(static_cast<float>(i) / 10, reloaded.flat<float>().data()[i]);
     }
   }
 }
+
+// Benchmark-related code below.
+
+void BM_LargeTensorWrite(::testing::benchmark::State& state) {
+  const int num_elements = state.range(0);
+
+  // 4 * num_elements bytes total , since sizeof(float) == 4.
+  Tensor tensor(DT_FLOAT, TensorShape({num_elements}));
+  tensor.flat<float>().setZero();
+
+  // Builds the graph.
+  const tstring temp_filename =
+      io::JoinPath(testing::TmpDir(), "benchmark_checkpoint");
+  auto root = Scope::NewRootScope().ExitOnError();
+  const tstring tensor_name = "my_tensor";
+  ops::Save give_me_a_name(root, temp_filename, {tensor_name}, {{tensor}});
+
+  // Disables optimizations.
+  SessionOptions session_options;
+  session_options.config.mutable_graph_options()
+      ->mutable_optimizer_options()
+      ->set_opt_level(tensorflow::OptimizerOptions::L0);
+
+  TF_CHECK_OK(root.status());
+  Graph* g = new Graph(OpRegistry::Global());
+  TF_CHECK_OK(root.ToGraph(g));
+  VLOG(1) << "Save op's output path: " << temp_filename;
+  VLOG(1) << "# nodes in Graph: " << g->num_nodes();
+
+  test::Benchmark("cpu", g, &session_options, nullptr, nullptr, "",
+                  /*old_benchmark_api*/ false)
+      .Run(state);
+}
+BENCHMARK(BM_LargeTensorWrite)->Arg((1 << 30) / 4 /* 1GB float tensor */);
 
 }  // namespace
 }  // namespace tensorflow

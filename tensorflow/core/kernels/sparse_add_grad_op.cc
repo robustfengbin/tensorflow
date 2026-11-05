@@ -1,4 +1,4 @@
-/* Copyright 2016 Google Inc. All Rights Reserved.
+/* Copyright 2016 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
 #include "tensorflow/core/framework/tensor.h"
@@ -35,41 +37,44 @@ class SparseAddGradOp : public OpKernel {
     OP_REQUIRES_OK(ctx, ctx->input("b_indices", &b_indices));
     OP_REQUIRES_OK(ctx, ctx->input("sum_indices", &sum_indices));
 
-    OP_REQUIRES(ctx, TensorShapeUtils::IsMatrix(a_indices->shape()) &&
-                         TensorShapeUtils::IsMatrix(b_indices->shape()) &&
-                         TensorShapeUtils::IsMatrix(sum_indices->shape()),
-                errors::InvalidArgument(
+    OP_REQUIRES(ctx,
+                TensorShapeUtils::IsMatrix(a_indices->shape()) &&
+                    TensorShapeUtils::IsMatrix(b_indices->shape()) &&
+                    TensorShapeUtils::IsMatrix(sum_indices->shape()),
+                absl::InvalidArgumentError(absl::StrCat(
                     "Input indices should be matrices but received shapes: ",
                     a_indices->shape().DebugString(), " and ",
                     b_indices->shape().DebugString(), " and ",
-                    sum_indices->shape().DebugString()));
+                    sum_indices->shape().DebugString())));
     OP_REQUIRES(
         ctx, TensorShapeUtils::IsVector(backprop_val_grad->shape()),
-        errors::InvalidArgument(
+        absl::InvalidArgumentError(absl::StrCat(
             "Input backprop_val_grad should be a vector but received shape: ",
-            backprop_val_grad->shape().DebugString()));
-    OP_REQUIRES(
-        ctx, a_indices->dim_size(1) == b_indices->dim_size(1) &&
-                 b_indices->dim_size(1) == sum_indices->dim_size(1),
-        errors::InvalidArgument("The densified operands should have the same "
-                                "ndims; for A, B, sum got: ",
-                                a_indices->dim_size(1), b_indices->dim_size(1),
-                                sum_indices->dim_size(1)));
-    OP_REQUIRES(
-        ctx, backprop_val_grad->NumElements() == sum_indices->dim_size(0),
-        errors::InvalidArgument("# elements of backprop_val_grad and # rows of "
-                                "sum_indices should match (#nnz of sum): got ",
-                                backprop_val_grad->NumElements(), " and ",
-                                sum_indices->dim_size(0)));
+            backprop_val_grad->shape().DebugString())));
+    OP_REQUIRES(ctx,
+                a_indices->dim_size(1) == b_indices->dim_size(1) &&
+                    b_indices->dim_size(1) == sum_indices->dim_size(1),
+                absl::InvalidArgumentError(
+                    absl::StrCat("The densified operands should have the same "
+                                 "ndims; for A, B, sum got: ",
+                                 a_indices->dim_size(1), b_indices->dim_size(1),
+                                 sum_indices->dim_size(1))));
+    OP_REQUIRES(ctx,
+                backprop_val_grad->NumElements() == sum_indices->dim_size(0),
+                absl::InvalidArgumentError(absl::StrCat(
+                    "# elements of backprop_val_grad and # rows of "
+                    "sum_indices should match (#nnz of sum): got ",
+                    backprop_val_grad->NumElements(), " and ",
+                    sum_indices->dim_size(0))));
 
     const int num_dims = a_indices->dim_size(1);
-    const int64 a_nnz = a_indices->dim_size(0);
-    const int64 b_nnz = b_indices->dim_size(0);
-    const int64 sum_nnz = backprop_val_grad->NumElements();
+    const int64_t a_nnz = a_indices->dim_size(0);
+    const int64_t b_nnz = b_indices->dim_size(0);
+    const int64_t sum_nnz = backprop_val_grad->NumElements();
 
-    const auto a_indices_mat = a_indices->matrix<int64>();
-    const auto b_indices_mat = b_indices->matrix<int64>();
-    const auto sum_indices_mat = sum_indices->matrix<int64>();
+    const auto a_indices_mat = a_indices->matrix<int64_t>();
+    const auto b_indices_mat = b_indices->matrix<int64_t>();
+    const auto sum_indices_mat = sum_indices->matrix<int64_t>();
 
     Tensor *a_val_grad, *b_val_grad;
     OP_REQUIRES_OK(ctx,
@@ -100,7 +105,7 @@ class SparseAddGradOp : public OpKernel {
 
     // Set-intersect the indices; fill in grads for positions in the
     // intersection.
-    int64 i = 0, j = 0, k = 0;
+    int64_t i = 0, j = 0, k = 0;
     bool a_idx_geq, b_idx_geq;
     while (i < a_nnz && j < b_nnz && k < sum_nnz) {
       a_idx_geq = b_idx_geq = true;
@@ -134,10 +139,10 @@ class SparseAddGradOp : public OpKernel {
 // This op should work for any T that SparseAdd is registered with.
 REGISTER_KERNELS(float);
 REGISTER_KERNELS(double);
-REGISTER_KERNELS(int64);
-REGISTER_KERNELS(int32);
-REGISTER_KERNELS(int16);
-REGISTER_KERNELS(int8);
+REGISTER_KERNELS(int64_t);
+REGISTER_KERNELS(int32_t);
+REGISTER_KERNELS(int16_t);
+REGISTER_KERNELS(int8_t);
 REGISTER_KERNELS(complex64);
 REGISTER_KERNELS(complex128);
 #undef REGISTER_KERNELS

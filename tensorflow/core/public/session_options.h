@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,21 +13,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef TENSORFLOW_PUBLIC_SESSION_OPTIONS_H_
-#define TENSORFLOW_PUBLIC_SESSION_OPTIONS_H_
+#ifndef TENSORFLOW_CORE_PUBLIC_SESSION_OPTIONS_H_
+#define TENSORFLOW_CORE_PUBLIC_SESSION_OPTIONS_H_
 
 #include <string>
-#include "tensorflow/core/platform/types.h"
+
 #include "tensorflow/core/protobuf/config.pb.h"
 
-namespace tensorflow {
-
+namespace tsl {
 class Env;
+}  // namespace tsl
+namespace tensorflow {
 
 /// Configuration information for a Session.
 struct SessionOptions {
   /// The environment to use.
-  Env* env;
+  tsl::Env* env;
 
   /// \brief The TensorFlow runtime to connect to.
   ///
@@ -52,7 +53,7 @@ struct SessionOptions {
   ///
   /// If the session disconnects from the remote process during its
   /// lifetime, session calls may fail immediately.
-  string target;
+  std::string target;
 
   /// Configuration options.
   ConfigProto config;
@@ -62,4 +63,4 @@ struct SessionOptions {
 
 }  // end namespace tensorflow
 
-#endif  // TENSORFLOW_PUBLIC_SESSION_OPTIONS_H_
+#endif  // TENSORFLOW_CORE_PUBLIC_SESSION_OPTIONS_H_

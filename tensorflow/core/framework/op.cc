@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,91 +17,159 @@ limitations under the License.
 
 #include <algorithm>
 #include <memory>
+#include <utility>
 #include <vector>
-#include "tensorflow/core/framework/op_kernel.h"
+
+#include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
+#include "tensorflow/core/framework/full_type.pb.h"
+#include "tensorflow/core/framework/op_def_builder.h"
+#include "tensorflow/core/framework/op_def_util.h"
 #include "tensorflow/core/lib/core/errors.h"
+#include "tensorflow/core/lib/core/stringpiece.h"
 #include "tensorflow/core/lib/gtl/map_util.h"
-#include "tensorflow/core/platform/logging.h"
+#include "tensorflow/core/platform/host_info.h"
 #include "tensorflow/core/platform/mutex.h"
-#include "tensorflow/core/platform/protobuf.h"
 #include "tensorflow/core/platform/types.h"
 
 namespace tensorflow {
 
+absl::Status DefaultValidator(const OpRegistryInterface& op_registry) {
+  LOG(WARNING) << "No kernel validator registered with OpRegistry.";
+  return absl::OkStatus();
+}
+
 // OpRegistry -----------------------------------------------------------------
 
-OpRegistryInterface::~OpRegistryInterface() {}
+absl::Status OpRegistryInterface::LookUpOpDef(const std::string& op_type_name,
+                                              const OpDef** op_def) const {
+  *op_def = nullptr;
+  const OpRegistrationData* op_reg_data = nullptr;
+  TF_RETURN_IF_ERROR(LookUp(op_type_name, &op_reg_data));
+  *op_def = &op_reg_data->op_def;
+  return absl::OkStatus();
+}
 
-OpRegistry::OpRegistry() : initialized_(false) {}
+OpRegistry::OpRegistry()
+    : initialized_(false), op_registry_validator_(DefaultValidator) {}
 
-void OpRegistry::Register(const OpDef& op_def) {
+void OpRegistry::Register(const OpRegistrationDataFactory& op_data_factory) {
   mutex_lock lock(mu_);
   if (initialized_) {
-    TF_QCHECK_OK(RegisterAlreadyLocked(op_def)) << "Attempting to register: "
-                                                << SummarizeOpDef(op_def);
+    TF_QCHECK_OK(RegisterAlreadyLocked(op_data_factory));
   } else {
-    deferred_.push_back(op_def);
-  }
-  if (watcher_) {
-    watcher_(op_def);
+    deferred_.push_back(op_data_factory);
   }
 }
 
-const OpDef* OpRegistry::LookUp(const string& op_type_name,
-                                Status* status) const {
-  const OpDef* op_def = nullptr;
+namespace {
+// Helper function that returns Status message for failed LookUp.
+absl::Status OpNotFound(const std::string& op_type_name) {
+  absl::Status status = absl::NotFoundError(absl::StrCat(
+      "Op type not registered '", op_type_name, "' in binary running on ",
+      port::Hostname(), ". ",
+      "Make sure the Op and Kernel are registered in the binary running in "
+      "this process. Note that if you are loading a saved graph which used ops "
+      "from tf.contrib (e.g. `tf.contrib.resampler`), accessing should be done "
+      "before importing the graph, as contrib ops are lazily registered when "
+      "the module is first accessed."));
+  VLOG(1) << status.ToString();
+  return status;
+}
+}  // namespace
+
+absl::Status OpRegistry::LookUp(const std::string& op_type_name,
+                                const OpRegistrationData** op_reg_data) const {
+  if ((*op_reg_data = LookUp(op_type_name))) return absl::OkStatus();
+  return OpNotFound(op_type_name);
+}
+
+const OpRegistrationData* OpRegistry::LookUp(
+    const std::string& op_type_name) const {
+  {
+    tf_shared_lock l(mu_);
+    if (initialized_) {
+      if (const OpRegistrationData* res =
+              gtl::FindWithDefault(registry_, op_type_name, nullptr).get()) {
+        return res;
+      }
+    }
+  }
+  return LookUpSlow(op_type_name);
+}
+
+const OpRegistrationData* OpRegistry::LookUpSlow(
+    const std::string& op_type_name) const {
+  const OpRegistrationData* res = nullptr;
+
   bool first_call = false;
+  bool first_unregistered = false;
   {  // Scope for lock.
     mutex_lock lock(mu_);
-    first_call = CallDeferred();
-    op_def = gtl::FindWithDefault(registry_, op_type_name, nullptr);
+    first_call = MustCallDeferred();
+    res = gtl::FindWithDefault(registry_, op_type_name, nullptr).get();
+
+    static bool unregistered_before = false;
+    first_unregistered = !unregistered_before && (res == nullptr);
+    if (first_unregistered) {
+      unregistered_before = true;
+    }
     // Note: Can't hold mu_ while calling Export() below.
   }
   if (first_call) {
-    TF_QCHECK_OK(ValidateKernelRegistrations(*this));
+    TF_QCHECK_OK(op_registry_validator_(*this));
   }
-  if (op_def == nullptr) {
-    status->Update(
-        errors::NotFound("Op type not registered '", op_type_name, "'"));
-    VLOG(1) << status->ToString();
-    static bool first_unregistered = true;
+  if (res == nullptr) {
     if (first_unregistered) {
       OpList op_list;
       Export(true, &op_list);
-      VLOG(1) << "All registered Ops:";
-      for (const auto& op : op_list.op()) {
-        VLOG(1) << SummarizeOpDef(op);
+      if (VLOG_IS_ON(3)) {
+        LOG(INFO) << "All registered Ops:";
+        for (const auto& op : op_list.op()) {
+          LOG(INFO) << SummarizeOpDef(op);
+        }
       }
-      first_unregistered = false;
     }
   }
-  return op_def;
+  return res;
 }
 
 void OpRegistry::GetRegisteredOps(std::vector<OpDef>* op_defs) {
   mutex_lock lock(mu_);
-  CallDeferred();
-  for (auto p : registry_) {
-    op_defs->push_back(*p.second);
+  MustCallDeferred();
+  for (const auto& p : registry_) {
+    op_defs->push_back(p.second->op_def);
   }
 }
 
-Status OpRegistry::SetWatcher(const Watcher& watcher) {
+void OpRegistry::GetOpRegistrationData(
+    std::vector<OpRegistrationData>* op_data) {
+  mutex_lock lock(mu_);
+  MustCallDeferred();
+  for (const auto& p : registry_) {
+    op_data->push_back(*p.second);
+  }
+}
+
+absl::Status OpRegistry::SetWatcher(const Watcher& watcher) {
   mutex_lock lock(mu_);
   if (watcher_ && watcher) {
-    return errors::AlreadyExists(
+    return absl::AlreadyExistsError(
         "Cannot over-write a valid watcher with another.");
   }
   watcher_ = watcher;
-  return Status::OK();
+  return absl::OkStatus();
 }
 
 void OpRegistry::Export(bool include_internal, OpList* ops) const {
   mutex_lock lock(mu_);
-  CallDeferred();
+  MustCallDeferred();
 
-  std::vector<std::pair<string, const OpDef*>> sorted(registry_.begin(),
-                                                      registry_.end());
+  std::vector<std::pair<absl::string_view, const OpRegistrationData*>> sorted;
+  sorted.reserve(registry_.size());
+  for (const auto& item : registry_) {
+    sorted.emplace_back(item.first, item.second.get());
+  }
   std::sort(sorted.begin(), sorted.end());
 
   auto out = ops->mutable_op();
@@ -109,43 +177,81 @@ void OpRegistry::Export(bool include_internal, OpList* ops) const {
   out->Reserve(sorted.size());
 
   for (const auto& item : sorted) {
-    if (include_internal || !StringPiece(item.first).starts_with("_")) {
-      *out->Add() = *item.second;
+    if (include_internal || !absl::StartsWith(item.first, "_")) {
+      *out->Add() = item.second->op_def;
     }
   }
 }
 
-string OpRegistry::DebugString(bool include_internal) const {
+void OpRegistry::DeferRegistrations() {
+  mutex_lock lock(mu_);
+  initialized_ = false;
+}
+
+void OpRegistry::ClearDeferredRegistrations() {
+  mutex_lock lock(mu_);
+  deferred_.clear();
+}
+
+absl::Status OpRegistry::ProcessRegistrations() const {
+  mutex_lock lock(mu_);
+  return CallDeferred();
+}
+
+std::string OpRegistry::DebugString(bool include_internal) const {
   OpList op_list;
   Export(include_internal, &op_list);
-  string ret;
+  std::string ret;
   for (const auto& op : op_list.op()) {
-    strings::StrAppend(&ret, SummarizeOpDef(op), "\n");
+    absl::StrAppend(&ret, SummarizeOpDef(op), "\n");
   }
   return ret;
 }
 
-bool OpRegistry::CallDeferred() const {
+bool OpRegistry::MustCallDeferred() const {
   if (initialized_) return false;
   initialized_ = true;
-  for (const auto& op_def : deferred_) {
-    TF_QCHECK_OK(RegisterAlreadyLocked(op_def)) << "Attempting to register: "
-                                                << SummarizeOpDef(op_def);
+  registry_.reserve(registry_.size() + deferred_.size());
+  for (const auto& op_data_factory : deferred_) {
+    TF_QCHECK_OK(RegisterAlreadyLocked(op_data_factory));
   }
   deferred_.clear();
   return true;
 }
 
-Status OpRegistry::RegisterAlreadyLocked(const OpDef& def) const {
-  TF_RETURN_IF_ERROR(ValidateOpDef(def));
-
-  std::unique_ptr<OpDef> copy(new OpDef(def));
-  if (gtl::InsertIfNotPresent(&registry_, def.name(), copy.get())) {
-    copy.release();  // Ownership transferred to op_registry
-    return Status::OK();
-  } else {
-    return errors::AlreadyExists("Op with name ", def.name());
+absl::Status OpRegistry::CallDeferred() const {
+  if (initialized_) return absl::OkStatus();
+  initialized_ = true;
+  registry_.reserve(registry_.size() + deferred_.size());
+  for (const auto& op_data_factory : deferred_) {
+    absl::Status s = RegisterAlreadyLocked(op_data_factory);
+    if (!s.ok()) {
+      return s;
+    }
   }
+  deferred_.clear();
+  return absl::OkStatus();
+}
+
+absl::Status OpRegistry::RegisterAlreadyLocked(
+    const OpRegistrationDataFactory& op_data_factory) const {
+  auto op_reg_data = std::make_unique<OpRegistrationData>();
+  const auto* op_reg_data_raw = op_reg_data.get();
+  absl::Status s = op_data_factory(op_reg_data.get());
+  if (s.ok()) {
+    s = ValidateOpDef(op_reg_data->op_def);
+  }
+  if (s.ok() &&
+      !registry_.try_emplace(op_reg_data->op_def.name(), std::move(op_reg_data))
+           .second) {
+    s = absl::AlreadyExistsError(
+        absl::StrCat("Op with name ", op_reg_data->op_def.name()));
+  }
+  absl::Status watcher_status = s;
+  if (watcher_) {
+    watcher_status = watcher_(s, op_reg_data_raw->op_def);
+  }
+  return watcher_status;
 }
 
 // static
@@ -157,31 +263,39 @@ OpRegistry* OpRegistry::Global() {
 // OpListOpRegistry -----------------------------------------------------------
 
 OpListOpRegistry::OpListOpRegistry(const OpList* op_list) {
+  index_.reserve(op_list->op_size());
   for (const OpDef& op_def : op_list->op()) {
-    index_[op_def.name()] = &op_def;
+    auto op_reg_data = std::make_unique<OpRegistrationData>();
+    op_reg_data->op_def = op_def;
+    index_[op_def.name()] = std::move(op_reg_data);
   }
 }
 
-const OpDef* OpListOpRegistry::LookUp(const string& op_type_name,
-                                      Status* status) const {
+const OpRegistrationData* OpListOpRegistry::LookUp(
+    const std::string& op_type_name) const {
   auto iter = index_.find(op_type_name);
   if (iter == index_.end()) {
-    status->Update(
-        errors::NotFound("Op type not registered '", op_type_name, "'"));
     return nullptr;
   }
-  return iter->second;
+  return iter->second.get();
 }
 
-// Other registration ---------------------------------------------------------
+absl::Status OpListOpRegistry::LookUp(
+    const std::string& op_type_name,
+    const OpRegistrationData** op_reg_data) const {
+  if ((*op_reg_data = LookUp(op_type_name))) return absl::OkStatus();
+  return OpNotFound(op_type_name);
+}
 
 namespace register_op {
-OpDefBuilderReceiver::OpDefBuilderReceiver(
-    const OpDefBuilderWrapper<true>& wrapper) {
-  OpDef op_def;
-  wrapper.builder().Finalize(&op_def);
-  OpRegistry::Global()->Register(op_def);
+
+InitOnStartupMarker OpDefBuilderWrapper::operator()() {
+  OpRegistry::Global()->Register(
+      [builder = std::move(builder_)](OpRegistrationData* op_reg_data)
+          -> absl::Status { return builder.Finalize(op_reg_data); });
+  return {};
 }
-}  // namespace register_op
+
+}  //  namespace register_op
 
 }  // namespace tensorflow

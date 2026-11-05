@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,41 +13,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef TENSORFLOW_PLATFORM_MUTEX_H_
-#define TENSORFLOW_PLATFORM_MUTEX_H_
+#ifndef TENSORFLOW_CORE_PLATFORM_MUTEX_H_
+#define TENSORFLOW_CORE_PLATFORM_MUTEX_H_
 
 #include "tensorflow/core/platform/platform.h"
+#include "tensorflow/core/platform/thread_annotations.h"
 #include "tensorflow/core/platform/types.h"
-
-namespace tensorflow {
-enum ConditionResult { kCond_Timeout, kCond_MaybeNotified };
-}  // namespace tensorflow
-
-// Include appropriate platform-dependent implementations of mutex etc.
-#if defined(PLATFORM_GOOGLE)
-#include "tensorflow/core/platform/google/mutex.h"
-#elif defined(PLATFORM_POSIX) || defined(PLATFORM_POSIX_ANDROID) || \
-    defined(PLATFORM_GOOGLE_ANDROID)
-#include "tensorflow/core/platform/default/mutex.h"
-#else
-#error Define the appropriate PLATFORM_<foo> macro for this platform
-#endif
-
-// The mutex library included above defines:
-//   class mutex;
-//   class mutex_lock;
-//   class condition_variable;
-// It also defines the following:
+#include "tsl/platform/mutex.h"
 
 namespace tensorflow {
 
-// Like "cv->wait(*mu)", except that it only waits for up to "ms" milliseconds.
-//
-// Returns kCond_Timeout if the timeout expired without this
-// thread noticing a signal on the condition variable.  Otherwise may
-// return either kCond_Timeout or kCond_MaybeNotified
-ConditionResult WaitForMilliseconds(mutex_lock* mu, condition_variable* cv,
-                                    int64 ms);
+using tsl::Condition;
+using tsl::condition_variable;
+using tsl::ConditionResult;
+using tsl::kCond_MaybeNotified;
+using tsl::kCond_Timeout;
+using tsl::LINKER_INITIALIZED;
+using tsl::LinkerInitialized;
+using tsl::mutex;
+using tsl::mutex_lock;
+using tsl::tf_shared_lock;
+using tsl::WaitForMilliseconds;
 }  // namespace tensorflow
 
-#endif  // TENSORFLOW_PLATFORM_MUTEX_H_
+#endif  // TENSORFLOW_CORE_PLATFORM_MUTEX_H_

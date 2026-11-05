@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,19 +15,20 @@ limitations under the License.
 
 // See docs in ../ops/parse_ops.cc.
 
-#include <errno.h>
-#include <string>
+#include <cstdint>
 
+#include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "tensorflow/core/framework/kernel_def_builder.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/tensor.h"
-#include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/lib/strings/numbers.h"
 
 namespace tensorflow {
 
-static constexpr char kErrorMessage[] =
+constexpr absl::string_view kErrorMessage =
     "StringToNumberOp could not correctly convert string: ";
 
 template <typename OutputType>
@@ -40,7 +41,7 @@ class StringToNumberOp : public OpKernel {
     // underlying storage.
     const Tensor* input_tensor;
     OP_REQUIRES_OK(context, context->input("string_tensor", &input_tensor));
-    const auto& input_flat = input_tensor->flat<string>();
+    const auto& input_flat = input_tensor->flat<tstring>();
 
     Tensor* output_tensor = nullptr;
     OP_REQUIRES_OK(context,
@@ -48,29 +49,17 @@ class StringToNumberOp : public OpKernel {
                                             &output_tensor));
     auto output_flat = output_tensor->flat<OutputType>();
 
-    for (int i = 0; i < input_flat.size(); ++i) {
-      Convert(input_flat(i), &output_flat(i), context);
+    for (int64_t i = 0; i < input_flat.size(); ++i) {
+      OP_REQUIRES(
+          context,
+          strings::SafeStringToNumeric<OutputType>(input_flat(i),
+                                                   &output_flat(i)),
+          // absl::StrCat correctly handles tstrings without needing .c_str()
+          absl::InvalidArgumentError(
+              absl::StrCat(kErrorMessage, input_flat(i))));
     }
   }
-
- private:
-  void Convert(const string& s, OutputType* output_data,
-               OpKernelContext* context);
 };
-
-template <>
-void StringToNumberOp<float>::Convert(const string& s, float* output_data,
-                                      OpKernelContext* context) {
-  OP_REQUIRES(context, strings::safe_strtof(s.c_str(), output_data),
-              errors::InvalidArgument(kErrorMessage, s));
-}
-
-template <>
-void StringToNumberOp<int32>::Convert(const string& s, int32* output_data,
-                                      OpKernelContext* context) {
-  OP_REQUIRES(context, strings::safe_strto32(s, output_data),
-              errors::InvalidArgument(kErrorMessage, s));
-}
 
 // Registers the currently supported output types.
 #define REGISTER(type)                                           \
@@ -79,7 +68,11 @@ void StringToNumberOp<int32>::Convert(const string& s, int32* output_data,
                               .TypeConstraint<type>("out_type"), \
                           StringToNumberOp<type>)
 REGISTER(float);
-REGISTER(int32);
+REGISTER(double);
+REGISTER(int32_t);
+REGISTER(int64_t);
+REGISTER(uint32_t);
+REGISTER(uint64_t);
 #undef REGISTER
 
 }  // namespace tensorflow

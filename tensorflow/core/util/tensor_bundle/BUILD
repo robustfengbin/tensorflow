@@ -1,0 +1,163 @@
+# Copyright 2026 The TensorFlow Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
+# Description:
+#   Tensor bundle: a module to efficiently serialize and deserialize tensors.
+
+load(
+    "//tensorflow:tensorflow.bzl",
+    "if_not_windows",
+    "if_windows",
+    "tf_cc_test",
+    "tf_copts",
+)
+load("//tensorflow:tensorflow.default.bzl", "cc_header_only_library", "filegroup")
+load("//tensorflow/core/platform:rules_cc.bzl", "cc_library")
+
+package(
+    # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
+    default_visibility = ["//visibility:public"],
+    licenses = ["notice"],
+)
+
+# To be exported to tensorflow/core:mobile_srcs.
+filegroup(
+    name = "mobile_srcs",
+    srcs = [
+        "byte_swap_tensor.cc",
+        "naming.cc",
+        "tensor_bundle.cc",
+    ],
+)
+
+filegroup(
+    name = "mobile_hdrs",
+    srcs = [
+        "byte_swap_array.h",
+        "byte_swap_tensor.h",
+        "naming.h",
+        "tensor_bundle.h",
+    ],
+)
+
+filegroup(
+    name = "android_srcs",
+    srcs = [
+        ":mobile_hdrs",
+        ":mobile_srcs",
+    ],
+)
+
+cc_library(
+    name = "tensor_bundle",
+    srcs = [
+        "tensor_bundle.cc",
+    ],
+    hdrs = [
+        "tensor_bundle.h",
+    ],
+    copts = tf_copts() + if_not_windows(["-Wno-sign-compare"]),
+    linkopts = if_windows(["-DEFAULTLIB:ws2_32.lib"]),
+    deps = [
+        ":byteswaptensor",
+        ":naming",
+        "//tensorflow/core:framework",
+        "//tensorflow/core:framework_internal",
+        "//tensorflow/core:lib",
+        "//tensorflow/core:lib_internal",
+        "//tensorflow/core:protos_all_cc",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/base",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/functional:function_ref",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:span",
+        "@xla//xla/tsl/lib/io:buffered_file",
+        "@xla//xla/tsl/util:byte_swap_array",
+    ],
+)
+
+cc_header_only_library(
+    name = "tensor_bundle_headers_lib",
+    features = ["-parse_headers"],  # Transitively pulls in Eigen headers
+    deps = [":tensor_bundle"],
+)
+
+cc_library(
+    name = "naming",
+    srcs = ["naming.cc"],
+    hdrs = ["naming.h"],
+    deps = [
+        "//tensorflow/core:lib",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+cc_library(
+    name = "byteswaparray",
+    hdrs = ["byte_swap_array.h"],
+    deps = [
+        "//tensorflow/core/platform:byte_order",
+        "//tensorflow/core/platform:errors",
+        "//tensorflow/core/platform:status",
+        "@xla//xla/tsl/util:byte_swap_array",
+    ],
+)
+
+cc_library(
+    name = "byteswaptensor",
+    srcs = ["byte_swap_tensor.cc"],
+    hdrs = ["byte_swap_tensor.h"],
+    deps = [
+        ":byteswaparray",
+        "//tensorflow/core:framework",
+        "//tensorflow/core:framework_internal",
+        "//tensorflow/core:protos_all_cc",
+        "//tensorflow/core/platform:byte_order",
+        "//tensorflow/core/platform:status",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@tsl//tsl/platform:platform_port",
+        "@xla//xla/tsl/platform:errors",
+        "@xla//xla/tsl/platform:logging",
+    ],
+)
+
+tf_cc_test(
+    name = "tensor_bundle_test",
+    srcs = ["tensor_bundle_test.cc"],
+    data = ["//tensorflow/core/util/tensor_bundle/testdata:old_string_tensors"],
+    tags = [
+        "nomsan",
+        "notsan",
+    ],
+    deps = [
+        ":byteswaptensor",
+        ":naming",
+        ":tensor_bundle",
+        "//tensorflow/core:framework",
+        "//tensorflow/core:lib",
+        "//tensorflow/core:lib_internal",
+        "//tensorflow/core:protos_all_cc",
+        "//tensorflow/core:test",
+        "//tensorflow/core:test_main",
+        "//tensorflow/core/framework:tensor_testutil",
+        "@com_google_absl//absl/status",
+    ],
+)

@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,21 +13,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef TENSORFLOW_GRAPH_EDGESET_H_
-#define TENSORFLOW_GRAPH_EDGESET_H_
+#ifndef TENSORFLOW_CORE_GRAPH_EDGESET_H_
+#define TENSORFLOW_CORE_GRAPH_EDGESET_H_
 
 #include <stddef.h>
-#include <set>
+
+#include "tensorflow/core/lib/gtl/flatset.h"
+#include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/platform/macros.h"
 #include "tensorflow/core/platform/types.h"
-
-#include "tensorflow/core/platform/logging.h"
 namespace tensorflow {
 
 class Edge;
 
 // An unordered set of edges.  Uses very little memory for small sets.
-// Unlike std::set, EdgeSet does NOT allow mutations during iteration.
+// Unlike gtl::FlatSet, EdgeSet does NOT allow mutations during
+// iteration.
 class EdgeSet {
  public:
   EdgeSet();
@@ -46,6 +47,15 @@ class EdgeSet {
   void clear();
   std::pair<iterator, bool> insert(value_type value);
   size_type erase(key_type key);
+  void reserve(size_type new_size) {
+    if (new_size > kInline) {
+      auto s = new gtl::FlatSet<const Edge*>(new_size);
+      s->insert(reinterpret_cast<const Edge**>(std::begin(ptrs_)),
+                reinterpret_cast<const Edge**>(&ptrs_[0] + size()));
+      ptrs_[0] = this;
+      ptrs_[1] = s;
+    }
+  }
 
   // Caller is not allowed to mutate the EdgeSet while iterating.
   const_iterator begin() const;
@@ -54,12 +64,15 @@ class EdgeSet {
  private:
   // Up to kInline elements are stored directly in ptrs_ (nullptr means none).
   // If ptrs_[0] == this then ptrs_[1] points to a set<const Edge*>.
-  static const int kInline = 2;  // Must be >= 2.
+  // kInline must be >= 2, and is chosen such that ptrs_ fills a 64 byte
+  // cacheline.
+  static constexpr int kInline = 64 / sizeof(const void*);
   const void* ptrs_[kInline];
 
-  std::set<const Edge*>* get_set() const {
+  gtl::FlatSet<const Edge*>* get_set() const {
     if (ptrs_[0] == this) {
-      return static_cast<std::set<const Edge*>*>(const_cast<void*>(ptrs_[1]));
+      return static_cast<gtl::FlatSet<const Edge*>*>(
+          const_cast<void*>(ptrs_[1]));
     } else {
       return nullptr;
     }
@@ -69,11 +82,12 @@ class EdgeSet {
 #ifdef NDEBUG
   void RegisterMutation() {}
 #else
-  uint32 mutations_ = 0;
+  uint32_t mutations_ = 0;
   void RegisterMutation() { mutations_++; }
 #endif
 
-  TF_DISALLOW_COPY_AND_ASSIGN(EdgeSet);
+  EdgeSet(const EdgeSet&) = delete;
+  void operator=(const EdgeSet&) = delete;
 };
 
 class EdgeSet::const_iterator {
@@ -84,7 +98,7 @@ class EdgeSet::const_iterator {
   typedef typename EdgeSet::difference_type difference_type;
   typedef std::forward_iterator_tag iterator_category;
 
-  const_iterator() {}
+  const_iterator() = default;
 
   const_iterator& operator++();
   const_iterator operator++(int /*unused*/);
@@ -99,21 +113,21 @@ class EdgeSet::const_iterator {
   friend class EdgeSet;
 
   void const* const* array_iter_ = nullptr;
-  typename std::set<const Edge*>::const_iterator tree_iter_;
+  typename gtl::FlatSet<const Edge*>::const_iterator tree_iter_;
 
 #ifdef NDEBUG
   inline void Init(const EdgeSet* e) {}
   inline void CheckNoMutations() const {}
 #else
-  inline void Init(const EdgeSet* e) {
+  void Init(const EdgeSet* e) {
     owner_ = e;
     init_mutations_ = e->mutations_;
   }
-  inline void CheckNoMutations() const {
+  void CheckNoMutations() const {
     CHECK_EQ(init_mutations_, owner_->mutations_);
   }
   const EdgeSet* owner_ = nullptr;
-  uint32 init_mutations_ = 0;
+  uint32_t init_mutations_ = 0;
 #endif
 };
 
@@ -229,4 +243,4 @@ inline bool EdgeSet::const_iterator::operator==(
 
 }  // namespace tensorflow
 
-#endif  // TENSORFLOW_GRAPH_EDGESET_H_
+#endif  // TENSORFLOW_CORE_GRAPH_EDGESET_H_

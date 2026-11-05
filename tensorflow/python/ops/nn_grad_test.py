@@ -1,0 +1,617 @@
+# Copyright 2016 The TensorFlow Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""Tests for Python ops defined in nn_grad.py."""
+
+import numpy as np
+
+from tensorflow.python.eager import backprop
+from tensorflow.python.framework import constant_op
+from tensorflow.python.framework import dtypes
+from tensorflow.python.framework import test_util
+from tensorflow.python.ops import array_ops
+from tensorflow.python.ops import gen_nn_ops
+from tensorflow.python.ops import gradient_checker
+from tensorflow.python.ops import gradient_checker_v2
+from tensorflow.python.ops import gradients_impl
+from tensorflow.python.ops import nn_grad  # pylint: disable=unused-import
+from tensorflow.python.ops import nn_impl
+from tensorflow.python.ops import nn_ops
+from tensorflow.python.platform import test
+
+
+class SoftmaxOpTest(test.TestCase):
+
+  # This test is for bfloat16, but the type has a problem with compute_gradient.
+  # TODO(penporn): Change the data type back to bfloat16 once b/157773623 is
+  # fixed. (compute_gradient internally converts bfloat16 to float32 for
+  # calculation anyway.)
+  def testSoftmaxGradGradExtendType(self):
+    with self.cached_session():
+
+      def f(x):
+        assert x.dtype == dtypes.float32
+        with backprop.GradientTape() as tape:
+          tape.watch(x)
+          y = nn_ops.softmax(x)
+        return tape.gradient(y, x)
+
+      x = constant_op.constant([[-2, -1, 1, 3], [5, 7, 8, 9]],
+                               dtype=dtypes.float32)
+      error = gradient_checker_v2.max_error(
+          *gradient_checker_v2.compute_gradient(f, [x]))
+      self.assertLess(error, 1e-4)
+
+
+class Relu6OpTest(test.TestCase):
+
+  @test_util.run_deprecated_v1
+  def testRelu6GradGrad(self):
+    inputs = constant_op.constant(
+        [[-2, -1, 1, 3], [5, 7, 8, 9]], dtype=dtypes.float32)
+    x_init_value = np.array([[-3.5, -1.5, 2, 4], [4.5, 7.5, 8.5, 11]])
+    r = nn_ops.relu6(inputs)
+    r_g = gradients_impl.gradients(r, inputs)[0]
+    with self.cached_session():
+      error = gradient_checker.compute_gradient_error(
+          inputs,
+          inputs.get_shape().as_list(),
+          r_g,
+          r_g.get_shape().as_list(),
+          x_init_value=x_init_value)
+      self.assertLess(error, 1e-4)
+
+
+class Conv2dOpTest(test.TestCase):
+
+  def run_test(self, x, y):
+    with self.test_session():
+      error = gradient_checker.compute_gradient_error(x,
+                                                      x.get_shape().as_list(),
+                                                      y,
+                                                      y.get_shape().as_list())
+      tol = 0.06 if test.is_gpu_available() else 2e-3
+      self.assertLess(error, tol)
+
+  @test_util.run_deprecated_v1
+  def testConv2dGradWRTInput(self):
+    x = array_ops.placeholder(
+        dtype=dtypes.float32, shape=[1, 4, 4, 3], name='input')
+    f = constant_op.constant([0.5],
+                             dtype=dtypes.float32,
+                             shape=[2, 2, 3, 2],
+                             name='filter')
+    y = nn_ops.conv2d(x, f, [1, 1, 1, 1], 'SAME')
+    self.run_test(x, y)
+
+  @test_util.run_deprecated_v1
+  def testConv2dGradWRTFilter(self):
+    x = constant_op.constant([0.5],
+                             dtype=dtypes.float32,
+                             shape=[1, 4, 4, 3],
+                             name='input')
+    f = array_ops.placeholder(
+        dtype=dtypes.float32, shape=[2, 2, 3, 2], name='filter')
+    y = nn_ops.conv2d(x, f, [1, 1, 1, 1], 'SAME')
+    self.run_test(f, y)
+
+  @test_util.run_deprecated_v1
+  def testConv2dBackpropFilterGrad(self):
+    x = array_ops.placeholder(
+        dtype=dtypes.float32, shape=[1, 4, 4, 3], name='input')
+    f = constant_op.constant([0.5],
+                             dtype=dtypes.float32,
+                             shape=[2, 2, 3, 2],
+                             name='filter')
+    strides = [1, 1, 1, 1]
+    padding = 'SAME'
+    out = nn_impl.depthwise_conv2d(x, f, strides, padding)
+
+    grad_wrt_input = gradients_impl.gradients(out, x)[0]
+    self.run_test(f, grad_wrt_input)
+
+    grad_wrt_filter = gradients_impl.gradients(out, f)[0]
+    self.run_test(x, grad_wrt_filter)
+
+
+class DepthwiseConv2dTest(test.TestCase):
+
+  def run_test(self, x, y):
+    with self.test_session():
+      error = gradient_checker.compute_gradient_error(x,
+                                                      x.get_shape().as_list(),
+                                                      y,
+                                                      y.get_shape().as_list())
+      self.assertLess(error, 2e-3)
+
+  @test_util.run_deprecated_v1
+  def testDepthwiseConv2dGradWRTInput(self):
+    x = array_ops.placeholder(
+        dtype=dtypes.float32, shape=[1, 4, 4, 3], name='input')
+    f = constant_op.constant([0.5],
+                             dtype=dtypes.float32,
+                             shape=[2, 2, 3, 2],
+                             name='filter')
+    strides = [1, 1, 1, 1]
+    padding = 'SAME'
+    y = nn_impl.depthwise_conv2d(x, f, strides, padding)
+    self.run_test(x, y)
+
+  @test_util.run_deprecated_v1
+  def testDepthwiseConv2dGradWRTFilter(self):
+    x = constant_op.constant([0.5],
+                             dtype=dtypes.float32,
+                             shape=[1, 4, 4, 3],
+                             name='input')
+    f = array_ops.placeholder(
+        dtype=dtypes.float32, shape=[2, 2, 3, 2], name='filter')
+    strides = [1, 1, 1, 1]
+    padding = 'SAME'
+    y = nn_impl.depthwise_conv2d(x, f, strides, padding)
+    self.run_test(f, y)
+
+  @test_util.run_deprecated_v1
+  def testDepthwiseConv2dBackpropFilterGrad(self):
+    x = array_ops.placeholder(
+        dtype=dtypes.float32, shape=[1, 4, 4, 3], name='input')
+    f = constant_op.constant([0.5],
+                             dtype=dtypes.float32,
+                             shape=[2, 2, 3, 2],
+                             name='filter')
+    strides = [1, 1, 1, 1]
+    padding = 'SAME'
+    out = nn_impl.depthwise_conv2d(x, f, strides, padding)
+
+    grad_wrt_input = gradients_impl.gradients(out, x)[0]
+    self.run_test(f, grad_wrt_input)
+
+    grad_wrt_filter = gradients_impl.gradients(out, f)[0]
+    self.run_test(x, grad_wrt_filter)
+
+
+class EluGradOpTest(test.TestCase):
+
+  @test_util.run_in_graph_and_eager_modes
+  def testEluGradPreservesSmallNegativeValues(self):
+    test_cases = (
+        (dtypes.float32, -20.0, 1e-6),
+        (dtypes.float64, -40.0, 1e-14),
+    )
+    for dtype, value, rtol in test_cases:
+      with self.subTest(dtype=dtype.name):
+        inputs = constant_op.constant(value, dtype=dtype)
+        with backprop.GradientTape() as tape:
+          tape.watch(inputs)
+          elu = gen_nn_ops.elu(inputs)
+
+        elu_grad = tape.gradient(elu, inputs)
+        expected = np.exp(dtype.as_numpy_dtype(value))
+        self.assertAllClose(
+            expected, self.evaluate(elu_grad), rtol=rtol, atol=0
+        )
+
+  @test_util.run_deprecated_v1
+  def testEluGradGradWRTgrad_ys(self):
+    inputs = constant_op.constant(
+        [[-2, -1, 1, 3], [5, 7, 8, 9]], dtype=dtypes.float32)
+    dummy = constant_op.constant(
+        [[3, 1, -1, -2], [9, 8, 7, 6]], dtype=dtypes.float32)
+
+    elu = gen_nn_ops.elu(inputs)
+    elu_grad = gradients_impl.gradients(elu, inputs, grad_ys=dummy)[0]
+    with self.cached_session():
+      error = gradient_checker.compute_gradient_error(
+          dummy,
+          dummy.shape,
+          elu_grad,
+          elu_grad.shape)
+      self.assertLess(error, 1e-4)
+
+  @test_util.run_deprecated_v1
+  def testEluGradGradWRTinputs(self):
+    inputs = constant_op.constant(
+        [[-2, -1, 1, 3], [5, 7, 8, 9]], dtype=dtypes.float32)
+    dummy = constant_op.constant(
+        [[3, 1, -1, -2], [9, 8, 7, 6]], dtype=dtypes.float32)
+
+    elu = gen_nn_ops.elu(inputs)
+    elu_grad = gradients_impl.gradients(elu, inputs, grad_ys=dummy)[0]
+    with self.cached_session():
+      error = gradient_checker.compute_gradient_error(
+          inputs,
+          inputs.shape,
+          elu_grad,
+          elu_grad.shape)
+      self.assertLess(error, 1e-4)
+
+
+class SeluGradOpTest(test.TestCase):
+
+  @test_util.run_in_graph_and_eager_modes
+  def testSeluGradPreservesSmallNegativeGradients(self):
+    scale_alpha = 1.7580993408473768599402175208123
+    test_cases = (
+        (dtypes.float32, -20.0, 1e-6),
+        (dtypes.float64, -700.0, 1e-14),
+    )
+    for dtype, value, rtol in test_cases:
+      with self.subTest(dtype=dtype.name):
+        inputs = constant_op.constant(value, dtype=dtype)
+        with backprop.GradientTape() as tape:
+          tape.watch(inputs)
+          selu = gen_nn_ops.selu(inputs)
+
+        selu_grad = tape.gradient(selu, inputs)
+        np_dtype = dtype.as_numpy_dtype
+        expected = np_dtype(scale_alpha) * np.exp(np_dtype(value))
+        self.assertAllClose(
+            expected, self.evaluate(selu_grad), rtol=rtol, atol=0
+        )
+
+  @test_util.run_in_graph_and_eager_modes
+  def testSeluGradEdgeCases(self):
+    scale = 1.0507009873554804934193349852946
+    scale_alpha = 1.7580993408473768599402175208123
+    for dtype in (dtypes.float32, dtypes.float64):
+      with self.subTest(dtype=dtype.name):
+        np_dtype = dtype.as_numpy_dtype
+        values = np.array(
+            [-np.inf, -2.0, -0.0, 0.0, 2.0, np.inf, np.nan], dtype=np_dtype
+        )
+        inputs = constant_op.constant(values, dtype=dtype)
+        with backprop.GradientTape() as tape:
+          tape.watch(inputs)
+          selu = gen_nn_ops.selu(inputs)
+
+        selu_grad = self.evaluate(tape.gradient(selu, inputs))
+        expected = np.array(
+            [
+                0.0,
+                np_dtype(scale_alpha) * np.exp(np_dtype(-2.0)),
+                scale,
+                scale,
+                scale,
+                scale,
+                np.nan,
+            ],
+            dtype=np_dtype,
+        )
+        self.assertAllClose(expected, selu_grad)
+
+  @test_util.run_deprecated_v1
+  def testSeluGradGradWRTgrad_ys(self):
+    inputs = constant_op.constant(
+        [[-2, -1, 1, 3], [5, 7, 8, 9]], dtype=dtypes.float32)
+    dummy = constant_op.constant(
+        [[3, 1, -1, -2], [9, 8, 7, 6]], dtype=dtypes.float32)
+
+    selu = gen_nn_ops.selu(inputs)
+    selu_grad = gradients_impl.gradients(selu, inputs, grad_ys=dummy)[0]
+    with self.cached_session():
+      error = gradient_checker.compute_gradient_error(
+          dummy,
+          dummy.shape,
+          selu_grad,
+          selu_grad.shape)
+      self.assertLess(error, 1e-4)
+
+  @test_util.run_deprecated_v1
+  def testSeluGradGradWRTinputs(self):
+    inputs = constant_op.constant(
+        [[-2, -1, 1, 3], [5, 7, 8, 9]], dtype=dtypes.float32)
+    dummy = constant_op.constant(
+        [[3, 1, -1, -2], [9, 8, 7, 6]], dtype=dtypes.float32)
+
+    selu = gen_nn_ops.selu(inputs)
+    selu_grad = gradients_impl.gradients(selu, inputs, grad_ys=dummy)[0]
+    with self.cached_session():
+      error = gradient_checker.compute_gradient_error(
+          inputs,
+          inputs.shape,
+          selu_grad,
+          selu_grad.shape)
+      self.assertLess(error, 1e-4)
+
+
+class SwishGradOpTest(test.TestCase):
+
+  def testSwishGrad(self):
+    features = constant_op.constant([[-2, -1, 1, 3]],
+                                    dtype=dtypes.float32)
+    beta = constant_op.constant(0.25, dtype=dtypes.float32)
+
+    with self.cached_session():
+      theoretical, numerical = gradient_checker_v2.compute_gradient(
+          nn_impl.swish, [features, beta])
+      error = gradient_checker_v2.max_error(theoretical, numerical)
+      self.assertLess(error, 1e-4)
+
+  @test_util.run_in_graph_and_eager_modes
+  def testSwishDoubleGradientPreservesSmallComponent(self):
+    features = constant_op.constant(40.410841513445845, dtypes.float64)
+    with backprop.GradientTape() as outer_tape:
+      outer_tape.watch(features)
+      with backprop.GradientTape() as inner_tape:
+        inner_tape.watch(features)
+        output = nn_impl.swish(features)
+      first_derivative = inner_tape.gradient(output, features)
+    second_derivative = self.evaluate(
+        outer_tape.gradient(first_derivative, features)
+    )
+
+    self.assertAllClose(
+        -1.0820525268131133e-16,
+        second_derivative,
+        rtol=1e-6,
+        atol=0.0,
+    )
+
+  @test_util.run_in_graph_and_eager_modes
+  def testSwishDoubleGradientPreservesNegativeExtreme(self):
+    features = constant_op.constant(-709.0, dtypes.float64)
+    with backprop.GradientTape() as outer_tape:
+      outer_tape.watch(features)
+      with backprop.GradientTape() as inner_tape:
+        inner_tape.watch(features)
+        output = nn_impl.swish(features)
+      first_derivative = inner_tape.gradient(output, features)
+    second_derivative = self.evaluate(
+        outer_tape.gradient(first_derivative, features)
+    )
+
+    self.assertAllClose(
+        -8.614807714413834e-306,
+        self.evaluate(first_derivative),
+        rtol=1e-6,
+        atol=0.0,
+    )
+    self.assertAllClose(
+        -8.6026399069076e-306,
+        second_derivative,
+        rtol=1e-6,
+        atol=0.0,
+    )
+
+  @test_util.run_in_graph_and_eager_modes
+  def testSwishDoubleGradientLargePositiveDoesNotNaN(self):
+    # For large positive logits (e.g. 1500.0), exp(logits / 2) would overflow
+    # to inf if unselected branches in the backward pass are not guarded,
+    # causing NaN propagation.
+    features = constant_op.constant(1500.0, dtypes.float64)
+    with backprop.GradientTape() as outer_tape:
+      outer_tape.watch(features)
+      with backprop.GradientTape() as inner_tape:
+        inner_tape.watch(features)
+        output = nn_impl.swish(features)
+      first_derivative = inner_tape.gradient(output, features)
+    second_derivative = self.evaluate(
+        outer_tape.gradient(first_derivative, features)
+    )
+
+    self.assertFalse(np.isnan(self.evaluate(first_derivative)))
+    self.assertFalse(np.isnan(second_derivative))
+    self.assertEqual(0.0, second_derivative)
+
+  @test_util.run_in_graph_and_eager_modes
+  def testSwishBetaGradientPreservesNegativeExtreme(self):
+    features = constant_op.constant(-709.0, dtypes.float64)
+    beta = constant_op.constant(1.0, dtypes.float64)
+    with backprop.GradientTape() as tape:
+      tape.watch(beta)
+      output = nn_impl.swish(features, beta=beta)
+    beta_grad = self.evaluate(tape.gradient(output, beta))
+
+    self.assertAllClose(
+        6.116525645041329e-303,
+        beta_grad,
+        rtol=1e-6,
+        atol=0.0,
+    )
+
+  @test_util.run_in_graph_and_eager_modes
+  def testSwishDoubleGradientMixedTensor(self):
+    features = constant_op.constant(
+        [-709.0, -500.0, -1.0, 0.0, 1.0, 1500.0], dtype=dtypes.float64
+    )
+    with backprop.GradientTape() as outer_tape:
+      outer_tape.watch(features)
+      with backprop.GradientTape() as inner_tape:
+        inner_tape.watch(features)
+        output = nn_impl.swish(features)
+      first_derivative = inner_tape.gradient(output, features)
+    second_derivative = self.evaluate(
+        outer_tape.gradient(first_derivative, features)
+    )
+    first_derivative = self.evaluate(first_derivative)
+    self.assertFalse(np.any(np.isnan(first_derivative)))
+    self.assertFalse(np.any(np.isnan(second_derivative)))
+
+    expected_first = [
+        -8.614807714413834e-306,
+        -3.5551636269639015e-215,
+        7.232948812851327e-2,
+        0.5,
+        0.9276705118714867,
+        1.0,
+    ]
+    expected_second = [
+        -8.6026399069076e-306,
+        -3.54803905055716e-215,
+        0.3023661188100153,
+        0.5,
+        0.3023661188100153,
+        0.0,
+    ]
+    self.assertAllClose(expected_first, first_derivative, rtol=1e-6, atol=0.0)
+    self.assertAllClose(expected_second, second_derivative, rtol=1e-6, atol=0.0)
+
+  @test_util.run_in_graph_and_eager_modes
+  def testSwishThirdDerivativePreservesNegativeExtreme(self):
+    features = constant_op.constant(-709.0, dtypes.float64)
+    with backprop.GradientTape() as t3:
+      t3.watch(features)
+      with backprop.GradientTape() as t2:
+        t2.watch(features)
+        with backprop.GradientTape() as t1:
+          t1.watch(features)
+          output = nn_impl.swish(features)
+        first_derivative = t1.gradient(output, features)
+      second_derivative = t2.gradient(first_derivative, features)
+    third_derivative = self.evaluate(t3.gradient(second_derivative, features))
+
+    self.assertAllClose(
+        -8.590472099401366e-306,
+        third_derivative,
+        rtol=1e-6,
+        atol=0.0,
+    )
+
+  @test_util.run_in_graph_and_eager_modes
+  def testSwishContinuityAroundNegativeBoundary(self):
+    delta = 1e-6
+    features = constant_op.constant(
+        [-500.0 - delta, -500.0 + delta], dtype=dtypes.float64
+    )
+    with backprop.GradientTape() as outer_tape:
+      outer_tape.watch(features)
+      with backprop.GradientTape() as inner_tape:
+        inner_tape.watch(features)
+        output = nn_impl.swish(features)
+      first_derivative = inner_tape.gradient(output, features)
+    second_derivative = self.evaluate(
+        outer_tape.gradient(first_derivative, features)
+    )
+    first_derivative = self.evaluate(first_derivative)
+
+    self.assertAllClose(
+        first_derivative[0], first_derivative[1], rtol=1e-5, atol=0.0
+    )
+    self.assertAllClose(
+        second_derivative[0], second_derivative[1], rtol=1e-5, atol=0.0
+    )
+
+  @test_util.run_in_graph_and_eager_modes
+  def testSwishEmptyFloat64(self):
+    features = constant_op.constant([], dtype=dtypes.float64)
+    beta = constant_op.constant(1.0, dtype=dtypes.float64)
+    with backprop.GradientTape() as outer_tape:
+      outer_tape.watch(features)
+      with backprop.GradientTape() as inner_tape:
+        inner_tape.watch(features)
+        output = nn_impl.swish(features, beta=beta)
+      first_derivative = inner_tape.gradient(output, features)
+    second_derivative = self.evaluate(
+        outer_tape.gradient(first_derivative, features)
+    )
+    output = self.evaluate(output)
+    first_derivative = self.evaluate(first_derivative)
+
+    with backprop.GradientTape() as beta_tape:
+      beta_tape.watch(beta)
+      output_beta = nn_impl.swish(features, beta=beta)
+    beta_grad = self.evaluate(beta_tape.gradient(output_beta, beta))
+
+    self.assertEqual((0,), output.shape)
+    self.assertEqual((0,), first_derivative.shape)
+    self.assertEqual((0,), second_derivative.shape)
+    self.assertEqual(0.0, beta_grad)
+
+
+class SoftmaxVJPFloat64InvarianceTest(test.TestCase):
+  """Regression tests for GitHub issue #126525.
+
+  tf.nn.softmax returned VJPs whose components did not sum to zero for
+  float64 inputs with extreme logit values (e.g. [40.0, 0.0]). Softmax is
+  invariant to adding a scalar to all logits, so its logit-Jacobian must
+  project out the all-ones direction; equivalently, every row of the VJP must
+  sum to zero.
+
+  The root cause was that when one logit dominates (e.g. [40.0, 0.0]),
+  (grad_softmax - sum_channels) suffered catastrophic cancellation
+  (1.0 - 1.0 = 0.0) at the dominant position while dropping the finite tail
+  (~4.25e-18). The fix subtracts the residual sum along the dominant component
+  to restore both the finite tail and the sum-to-zero invariant.
+  """
+
+  _TOL = 1e-28  # Absolute tolerance for "sum equals zero" check (float64)
+
+  def testSoftmaxVJPSumsToZeroFloat64ExtremeLogits(self):
+    """tf.nn.softmax VJP must sum to zero for float64 extreme logits."""
+    with self.cached_session():
+      logits = constant_op.constant([40.0, 0.0], dtype=dtypes.float64)
+      with backprop.GradientTape() as tape:
+        tape.watch(logits)
+        output = nn_ops.softmax(logits)[0]
+      g = tape.gradient(output, logits)
+      vjp_sum_val, _ = self.evaluate([g[0] + g[1], g])
+      vjp_sum = float(vjp_sum_val)
+      self.assertAlmostEqual(
+          vjp_sum,
+          0.0,
+          delta=self._TOL,
+          msg=f'Softmax VJP sum must be 0 for float64, got {vjp_sum}',
+      )
+
+  def testSoftmaxVJPSumsToZeroFloat64StandardLogits(self):
+    """tf.nn.softmax VJP must sum to zero for typical float64 logits too."""
+    with self.cached_session():
+      logits = constant_op.constant([1.0, 2.0, 3.0], dtype=dtypes.float64)
+      with backprop.GradientTape() as tape:
+        tape.watch(logits)
+        loss = nn_ops.softmax(logits)[1]
+      g = tape.gradient(loss, logits)
+      vjp_sum_val, _ = self.evaluate([g[0] + g[1] + g[2], g])
+      vjp_sum = float(vjp_sum_val)
+      self.assertAlmostEqual(
+          vjp_sum,
+          0.0,
+          delta=1e-15,
+          msg=f'Softmax VJP sum must be 0 for standard float64, got {vjp_sum}',
+      )
+
+  def testSoftmaxVJPFloat32Unchanged(self):
+    """float32 softmax VJP must still work (no regression)."""
+    with self.cached_session():
+      logits = constant_op.constant([40.0, 0.0], dtype=dtypes.float32)
+      with backprop.GradientTape() as tape:
+        tape.watch(logits)
+        output = nn_ops.softmax(logits)[0]
+      g = tape.gradient(output, logits)
+      g_val = self.evaluate(g)
+      # For float32 the sum may not be perfectly zero due to float32 precision,
+      # but the gradient must be finite and of correct shape.
+      self.assertEqual(g_val.shape, (2,))
+      self.assertTrue(
+          np.all(np.isfinite(g_val)), msg='float32 gradient must be finite'
+      )
+
+  def testSoftmaxVJPGradientCheckerFloat64(self):
+    """Gradient checker must pass for softmax over a float64 range."""
+    with self.cached_session():
+      xs = np.array([[40.0, 0.0], [1.0, 2.0], [-1.0, 1.0]], dtype=np.float64)
+      err = gradient_checker_v2.max_error(
+          *gradient_checker_v2.compute_gradient(nn_ops.softmax, [xs])
+      )
+      # Central finite difference with default delta=1/1024 has an O(delta^2)
+      # truncation error of ~6.18e-9 for softmax on this range. 1e-7 accounts
+      # for numerical discretization while maintaining high precision.
+      self.assertLess(
+          err,
+          1e-7,
+          msg=f'Gradient checker failed for softmax float64: err={err}',
+      )
+
+
+if __name__ == "__main__":
+  test.main()

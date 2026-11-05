@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,15 +13,26 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-// The utility to check whether we have Cudnn dependency.
+// The utility to check Cudnn dependency and set Cudnn-related flags.
 
-#ifndef TENSORFLOW_UTIL_USE_CUDNN_H_
-#define TENSORFLOW_UTIL_USE_CUDNN_H_
+#ifndef TENSORFLOW_CORE_UTIL_USE_CUDNN_H_
+#define TENSORFLOW_CORE_UTIL_USE_CUDNN_H_
+
+#include <cstdint>
+
+#include "xla/tsl/util/use_cudnn.h"
 
 namespace tensorflow {
 
-bool CanUseCudnn();
+using tsl::CudnnDisableConv1x1Optimization;
+using tsl::CudnnRnnUseAutotune;
+using tsl::CudnnUseAutotune;
+using tsl::CudnnUseRuntimeFusion;
+using tsl::DebugCudnnRnn;
+using tsl::DebugCudnnRnnAlgo;
+using tsl::DebugCudnnRnnUseTensorOps;
+using tsl::ShouldCudnnGroupedConvolutionBeUsed;
 
 }  // namespace tensorflow
 
-#endif  // TENSORFLOW_UTIL_USE_CUDNN_H_
+#endif  // TENSORFLOW_CORE_UTIL_USE_CUDNN_H_

@@ -1,0 +1,427 @@
+/* Copyright 2020 The TensorFlow Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+#include <algorithm>
+#include <cfloat>
+#include <cstddef>
+#include <cstdint>
+#include <iterator>
+#include <map>
+#include <memory>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <tuple>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include "absl/base/no_destructor.h"
+#include "absl/log/check.h"
+#include "absl/status/status.h"
+#include "pybind11/pybind11.h"  // from @pybind11
+#include "pybind11/stl.h"  // from @pybind11
+#include "tensorflow/core/framework/kernel_def.pb.h"
+#include "tensorflow/core/framework/memory_types.h"
+#include "tensorflow/core/framework/op_def.pb.h"
+#include "tensorflow/core/framework/step_stats.pb.h"
+#include "tensorflow/core/grappler/clusters/cluster.h"
+#include "tensorflow/core/grappler/clusters/single_machine.h"
+#include "tensorflow/core/grappler/clusters/virtual_cluster.h"
+#include "tensorflow/core/grappler/costs/cost_estimator.h"
+#include "tensorflow/core/grappler/costs/graph_memory.h"
+#include "tensorflow/core/grappler/costs/measuring_cost_estimator.h"
+#include "tensorflow/core/grappler/costs/op_level_cost_estimator.h"
+#include "tensorflow/core/grappler/costs/op_performance_data.pb.h"
+#include "tensorflow/core/grappler/costs/utils.h"
+#include "tensorflow/core/grappler/devices.h"
+#include "tensorflow/core/grappler/grappler_item.h"
+#include "tensorflow/core/grappler/utils.h"
+#include "tensorflow/core/platform/mutex.h"
+#include "tensorflow/core/platform/status.h"
+#include "tensorflow/core/protobuf/config.pb.h"
+#include "tensorflow/core/protobuf/device_properties.pb.h"
+#include "tensorflow/python/lib/core/pybind11_status.h"
+
+namespace py = pybind11;
+
+namespace {
+
+// SingleMachine uses process-global provisioning state. Serialize Python
+// creation/shutdown paths that update that state without relying on static
+// destruction order during interpreter shutdown.
+tensorflow::mutex& GetClusterLifecycleMutex() {
+  static absl::NoDestructor<tensorflow::mutex> mu;
+  return *mu;
+}
+
+absl::Status _GetOpPerformanceDataAndRunTime(
+    const tensorflow::grappler::GrapplerItem& item,
+    tensorflow::grappler::CostEstimator* cost_measure,
+    tensorflow::OpPerformanceList* op_performance_data,
+    tensorflow::grappler::Costs* costs) {
+  absl::Status status = cost_measure->Initialize(item);
+  if (!status.ok()) return status;
+
+  tensorflow::RunMetadata run_metadata;
+  tsl::MaybeRaiseRegisteredFromStatusWithGIL(
+      cost_measure->PredictCosts(item.graph, &run_metadata, costs));
+
+  if (op_performance_data) {
+    *op_performance_data = tensorflow::grappler::CostGraphToOpPerformanceData(
+        run_metadata.cost_graph(), item.graph);
+  }
+  return absl::OkStatus();
+}
+
+}  // namespace
+
+PYBIND11_MAKE_OPAQUE(tensorflow::grappler::Cluster);
+
+PYBIND11_MODULE(_pywrap_tf_cluster, m, pybind11::mod_gil_not_used()) {
+  py::class_<tensorflow::grappler::Cluster> grappler_cluster(m, "Cluster");
+
+  m.def("TF_NewCluster",
+        [](bool allow_soft_placement,
+           bool disable_detailed_stats) -> tensorflow::grappler::Cluster* {
+          // TODO(petebu): Make these named arguments with default values
+          // instead.
+          std::unique_ptr<tensorflow::grappler::Cluster> cluster;
+          absl::Status provision_status;
+          {
+            py::gil_scoped_release release;
+            tensorflow::mutex_lock lifecycle_lock(GetClusterLifecycleMutex());
+            int num_cpu_cores =
+                tensorflow::grappler::GetNumAvailableLogicalCPUCores();
+            int num_gpus = tensorflow::grappler::GetNumAvailableGPUs();
+            int timeout_s = 60 * 10;
+            cluster = std::make_unique<tensorflow::grappler::SingleMachine>(
+                timeout_s, num_cpu_cores, num_gpus);
+            cluster->DisableDetailedStats(disable_detailed_stats);
+            cluster->AllowSoftPlacement(allow_soft_placement);
+            cluster->SetNumWarmupSteps(10);
+            provision_status = cluster->Provision();
+            if (!provision_status.ok()) {
+              cluster.reset();
+            }
+          }
+          tsl::MaybeRaiseRegisteredFromStatus(provision_status);
+          return cluster.release();
+        });
+
+  m.def("TF_NewVirtualCluster",
+        [](const std::vector<py::bytes>& serialized_named_devices)
+            -> tensorflow::grappler::Cluster* {
+          std::vector<tensorflow::NamedDevice> named_devices;
+          for (const auto& s : serialized_named_devices) {
+            tensorflow::NamedDevice named_device;
+            if (!named_device.ParseFromString(std::string(s))) {
+              throw std::invalid_argument(
+                  "The NamedDevice could not be parsed as a valid protocol "
+                  "buffer");
+            }
+            named_devices.push_back(named_device);
+          }
+
+          std::unordered_map<std::string, tensorflow::DeviceProperties> devices;
+          for (const auto& named_device : named_devices) {
+            devices[named_device.name()] = named_device.properties();
+          }
+          std::unique_ptr<tensorflow::grappler::Cluster> cluster =
+              std::make_unique<tensorflow::grappler::VirtualCluster>(devices);
+          absl::Status provision_status;
+          {
+            py::gil_scoped_release release;
+            provision_status = cluster->Provision();
+          }
+          tsl::MaybeRaiseRegisteredFromStatus(provision_status);
+          return cluster.release();
+        });
+
+  m.def("TF_ShutdownCluster", [](tensorflow::grappler::Cluster* cluster) {
+    if (cluster == nullptr) {
+      return;
+    }
+    const bool is_single_machine = cluster->type() == "single_machine";
+    py::gil_scoped_release release;
+    if (is_single_machine) {
+      tensorflow::mutex_lock lifecycle_lock(GetClusterLifecycleMutex());
+      (void)cluster->Shutdown();
+    } else {
+      (void)cluster->Shutdown();
+    }
+  });
+
+  m.def("TF_ListDevices",
+        [](tensorflow::grappler::Cluster* cluster) -> std::vector<py::bytes> {
+          if (cluster == nullptr) {
+            tsl::MaybeRaiseRegisteredFromStatus(
+                absl::InvalidArgumentError("Cluster cannot be None."));
+          }
+
+          const auto& cluster_devices = cluster->GetDevices();
+          std::vector<
+              const std::pair<const std::string, tensorflow::DeviceProperties>*>
+              sorted_devices;
+          sorted_devices.reserve(cluster_devices.size());
+          for (const auto& dev : cluster_devices) {
+            sorted_devices.push_back(&dev);
+          }
+          std::sort(
+              sorted_devices.begin(), sorted_devices.end(),
+              [](const auto* a, const auto* b) { return a->first < b->first; });
+
+          std::vector<py::bytes> named_devices;
+          named_devices.reserve(sorted_devices.size());
+          for (const auto* dev : sorted_devices) {
+            tensorflow::NamedDevice d;
+            d.set_name(dev->first);
+            *d.mutable_properties() = dev->second;
+            named_devices.push_back(d.SerializeAsString());
+          }
+          return named_devices;
+        });
+
+  m.def("TF_ListAvailableOps", []() -> std::vector<std::string> {
+    tensorflow::OpRegistry* registry = tensorflow::OpRegistry::Global();
+    std::vector<tensorflow::OpDef> ops;
+    registry->GetRegisteredOps(&ops);
+    std::vector<std::string> op_names;
+    op_names.reserve(ops.size());
+    for (const tensorflow::OpDef& op : ops) {
+      op_names.push_back(op.name());
+    }
+    std::sort(op_names.begin(), op_names.end());
+    return op_names;
+  });
+
+  m.def(
+      "TF_GetSupportedDevices",
+      [](tensorflow::grappler::Cluster* cluster,
+         tensorflow::grappler::GrapplerItem* item)
+          -> std::unordered_map<std::string, std::vector<std::string>> {
+        if (cluster == nullptr || item == nullptr) {
+          tsl::MaybeRaiseRegisteredFromStatus(absl::Status(
+              absl::InternalError("You need both a cluster and an "
+                                  "item to get supported devices.")));
+        }
+
+        std::unordered_map<std::string, std::vector<std::string>> result;
+        {
+          py::gil_scoped_release release;
+          std::map<std::string, std::set<std::string>> device_types;
+          std::string cluster_type;
+
+          {
+            const auto& devices = cluster->GetDevices();
+            cluster_type = cluster->type();
+
+            for (const auto& dev : devices) {
+              device_types[dev.second.type()].insert(dev.first);
+            }
+          }
+
+          if (cluster_type != "single_machine") {
+            std::vector<std::string> all_device_names;
+            for (const auto& dev : device_types) {
+              for (const std::string& name : dev.second) {
+                all_device_names.push_back(name);
+              }
+            }
+            for (const auto& node : item->graph.node()) {
+              result[node.name()] = all_device_names;
+            }
+          } else {
+            std::unordered_map<std::string, std::set<std::string>>
+                supported_device_types;
+            std::unordered_map<std::string, std::set<std::string>>
+                device_restrictions;
+
+            for (const auto& node : item->graph.node()) {
+              auto& supported = supported_device_types[node.name()];
+              for (const auto& dev : device_types) {
+                const std::string& type = dev.first;
+
+                // Check the kernel capabilities.
+                const tensorflow::DeviceType dev_type(type);
+                absl::Status s =
+                    tensorflow::FindKernelDef(dev_type, node, nullptr, nullptr);
+                if (s.ok()) {
+                  supported.insert(type);
+
+                  // Check which inputs are restricted to reside on the host.
+                  // TODO: extends this to support outputs as well.
+                  tensorflow::MemoryTypeVector inp_mtypes;
+                  tensorflow::MemoryTypeVector out_mtypes;
+                  absl::Status s2 = tensorflow::MemoryTypesForNode(
+                      tensorflow::OpRegistry::Global(), dev_type, node,
+                      &inp_mtypes, &out_mtypes);
+                  if (s2.ok()) {
+                    for (size_t i = 0; i < inp_mtypes.size(); ++i) {
+                      if (inp_mtypes[i] == tensorflow::HOST_MEMORY) {
+                        device_restrictions[tensorflow::grappler::NodeName(
+                                                node.input(i))]
+                            .insert("CPU");
+                        break;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+
+            for (const auto& supported_dev : supported_device_types) {
+              const std::string& node = supported_dev.first;
+              const auto it = device_restrictions.find(node);
+              std::vector<std::string> device_names;
+
+              if (it != device_restrictions.end()) {
+                std::set<std::string> feasible;
+                const std::set<std::string>& candidates = supported_dev.second;
+                const std::set<std::string>& valid = it->second;
+                std::set_intersection(
+                    candidates.begin(), candidates.end(), valid.begin(),
+                    valid.end(), std::inserter(feasible, feasible.begin()));
+                for (const std::string& type : feasible) {
+                  auto type_it = device_types.find(type);
+                  DCHECK(type_it != device_types.end());
+                  for (const std::string& name : type_it->second) {
+                    device_names.push_back(name);
+                  }
+                }
+              } else {
+                for (const std::string& type : supported_dev.second) {
+                  auto type_it = device_types.find(type);
+                  DCHECK(type_it != device_types.end());
+                  for (const std::string& name : type_it->second) {
+                    device_names.push_back(name);
+                  }
+                }
+              }
+              result.emplace(node, std::move(device_names));
+            }
+          }
+        }
+        return result;
+      });
+
+  m.def("TF_EstimatePerformance", [](const py::bytes& serialized_device) {
+    tensorflow::NamedDevice device;
+    if (!device.ParseFromString(std::string(serialized_device))) {
+      throw std::invalid_argument(
+          "The NamedDevice could not be parsed as a valid protocol buffer");
+    }
+    tensorflow::grappler::OpLevelCostEstimator estimator;
+    tensorflow::grappler::DeviceInfo info =
+        estimator.GetDeviceInfo(device.properties());
+    return info.gigaops;
+  });
+
+  m.def("TF_MeasureCosts",
+        [](tensorflow::grappler::GrapplerItem* item,
+           tensorflow::grappler::Cluster* cluster, bool generate_timeline)
+            -> std::tuple<std::vector<py::bytes>, double, py::bytes> {
+          if (cluster == nullptr || item == nullptr) {
+            tsl::MaybeRaiseRegisteredFromStatus(absl::InvalidArgumentError(
+                "You need both a cluster and an item to measure costs."));
+          }
+
+          const int num_measurements = cluster->type() == "virtual" ? 1 : 10;
+          tensorflow::grappler::MeasuringCostEstimator cost_measure(
+              cluster, num_measurements, 0);
+
+          tensorflow::OpPerformanceList op_performance_data;
+          tensorflow::grappler::Costs costs;
+          absl::Status s;
+          {
+            py::gil_scoped_release release;
+            s = _GetOpPerformanceDataAndRunTime(*item, &cost_measure,
+                                                &op_performance_data, &costs);
+          }
+          double run_time = FLT_MAX;
+          if (s.ok()) {
+            run_time = static_cast<double>(costs.execution_time.count()) / 1e9;
+          }
+          tensorflow::StepStats step_stats;
+          if (generate_timeline) {
+            tensorflow::RunMetadata metadata;
+            absl::Status run_status;
+            {
+              py::gil_scoped_release release;
+              run_status =
+                  cluster->Run(item->graph, item->feed, item->fetch, &metadata);
+            }
+            tsl::MaybeRaiseRegisteredFromStatus(run_status);
+            step_stats = metadata.step_stats();
+          }
+
+          std::vector<py::bytes> op_perf_objs;
+          op_perf_objs.resize(op_performance_data.op_performance_size());
+          for (int i = 0; i < op_performance_data.op_performance_size(); i++) {
+            op_perf_objs[i] =
+                op_performance_data.op_performance(i).SerializeAsString();
+          }
+
+          py::bytes step_stats_str = step_stats.SerializeAsString();
+          return std::make_tuple(op_perf_objs, run_time, step_stats_str);
+        });
+
+  using DurationType = tensorflow::grappler::Costs::Duration::rep;
+  using MemoryUsage =
+      std::tuple<std::string, int, size_t, DurationType, DurationType>;
+
+  m.def(
+      "TF_DeterminePeakMemoryUsage",
+      [](tensorflow::grappler::GrapplerItem* item,
+         tensorflow::grappler::Cluster* cluster)
+          -> std::unordered_map<std::string,
+                                std::tuple<int64_t, std::vector<MemoryUsage>>> {
+        if (cluster == nullptr || item == nullptr) {
+          tsl::MaybeRaiseRegisteredFromStatus(absl::Status(absl::InternalError(
+              "You need both a cluster and an item to determine peak "
+              "memory usage.")));
+        }
+
+        tensorflow::grappler::GraphMemory memory(*item);
+
+        absl::Status inference_status;
+        {
+          py::gil_scoped_release release;
+          if (cluster->DetailedStatsEnabled()) {
+            inference_status = memory.InferDynamically(cluster);
+          } else {
+            inference_status = memory.InferStatically(cluster->GetDevices());
+          }
+        }
+        tsl::MaybeRaiseRegisteredFromStatus(inference_status);
+
+        std::unordered_map<std::string,
+                           std::tuple<int64_t, std::vector<MemoryUsage>>>
+            result;
+        for (const auto& device : cluster->GetDevices()) {
+          const tensorflow::grappler::GraphMemory::MemoryUsage& usage =
+              memory.GetPeakMemoryUsage(device.first);
+          std::vector<MemoryUsage> per_device;
+          for (size_t i = 0; i < usage.live_tensors.size(); ++i) {
+            const auto& live_tensor = usage.live_tensors[i];
+            per_device.push_back(std::make_tuple(
+                live_tensor.node, live_tensor.output_id,
+                live_tensor.memory_used, live_tensor.allocation_time.count(),
+                live_tensor.deallocation_time.count()));
+          }
+          result[device.first] = std::make_tuple(usage.used_memory, per_device);
+        }
+        return result;
+      });
+}

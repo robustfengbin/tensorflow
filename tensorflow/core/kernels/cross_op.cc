@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ limitations under the License.
 #include <algorithm>
 #include <cmath>
 
-#include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
+#include "unsupported/Eigen/CXX11/Tensor"  // from @eigen_archive
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
 #include "tensorflow/core/framework/tensor.h"
@@ -44,13 +44,14 @@ class CrossOp : public OpKernel {
   void Compute(OpKernelContext* context) override {
     const Tensor& in0 = context->input(0);
     const Tensor& in1 = context->input(1);
-    OP_REQUIRES(context, in0.shape() == in1.shape(),
-                errors::InvalidArgument("Both inputs must be of same shape: ",
-                                        in0.shape().DebugString(), " vs. ",
-                                        in1.shape().DebugString()));
+    OP_REQUIRES(
+        context, in0.shape() == in1.shape(),
+        absl::InvalidArgumentError(absl::StrCat(
+            "Both inputs must be of same shape: ", in0.shape().DebugString(),
+            " vs. ", in1.shape().DebugString())));
     OP_REQUIRES(context, in0.dims() >= 1,
-                errors::InvalidArgument("Input must be at least 1D",
-                                        in0.shape().DebugString()));
+                absl::InvalidArgumentError(absl::StrCat(
+                    "Input must be at least 1D", in0.shape().DebugString())));
 
     // Cross-products only really make sense for three and
     // seven dimensions, and the latter is very obscure. If there is
@@ -59,7 +60,7 @@ class CrossOp : public OpKernel {
     // that all are 3D.
     auto inner_dim = in0.dim_size(in0.dims() - 1);
     OP_REQUIRES(context, inner_dim == 3,
-                errors::FailedPrecondition(
+                absl::FailedPreconditionError(
                     "Cross-products are only defined for 3-element vectors."));
 
     // Create the output Tensor with the same dimensions as the input Tensors.
@@ -87,7 +88,7 @@ class CrossOp : public OpKernel {
 TF_CALL_REAL_NUMBER_TYPES(REGISTER_CPU_KERNEL);
 #undef REGISTER_CPU_KERNEL
 
-#if GOOGLE_CUDA
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 // Forward declarations of the function specializations for GPU (to prevent
 // building the GPU versions here, they will be built compiling _gpu.cu.cc).
 namespace functor {
@@ -105,6 +106,7 @@ TF_CALL_REAL_NUMBER_TYPES(DECLARE_GPU_KERNEL);
   REGISTER_KERNEL_BUILDER(                                        \
       Name("Cross").Device(DEVICE_GPU).TypeConstraint<type>("T"), \
       CrossOp<GPUDevice, type>);
+
 TF_CALL_REAL_NUMBER_TYPES(REGISTER_GPU_KERNEL);
 #undef REGISTER_GPU_KERNEL
 #endif

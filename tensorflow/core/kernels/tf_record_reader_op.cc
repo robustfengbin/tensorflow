@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,8 +16,10 @@ limitations under the License.
 // See docs in ../ops/io_ops.cc.
 
 #include <memory>
+
+#include "absl/status/status.h"
+#include "tensorflow/core/framework/reader_base.h"
 #include "tensorflow/core/framework/reader_op_kernel.h"
-#include "tensorflow/core/kernels/reader_base.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/io/record_reader.h"
 #include "tensorflow/core/lib/strings/strcat.h"
@@ -27,40 +29,43 @@ namespace tensorflow {
 
 class TFRecordReader : public ReaderBase {
  public:
-  TFRecordReader(const string& node_name, Env* env)
-      : ReaderBase(strings::StrCat("TFRecordReader '", node_name, "'")),
+  TFRecordReader(const std::string& node_name,
+                 const std::string& compression_type, Env* env)
+      : ReaderBase(absl::StrCat("TFRecordReader '", node_name, "'")),
         env_(env),
-        offset_(0) {}
+        offset_(0),
+        compression_type_(compression_type) {}
 
-  Status OnWorkStartedLocked() override {
+  absl::Status OnWorkStartedLocked() override {
     offset_ = 0;
-    RandomAccessFile* file = nullptr;
-    TF_RETURN_IF_ERROR(env_->NewRandomAccessFile(current_work(), &file));
-    file_.reset(file);
-    reader_.reset(new io::RecordReader(file));
-    return Status::OK();
+    TF_RETURN_IF_ERROR(env_->NewRandomAccessFile(current_work(), &file_));
+
+    io::RecordReaderOptions options =
+        io::RecordReaderOptions::CreateRecordReaderOptions(compression_type_);
+    reader_.reset(new io::RecordReader(file_.get(), options));
+    return absl::OkStatus();
   }
 
-  Status OnWorkFinishedLocked() override {
+  absl::Status OnWorkFinishedLocked() override {
     reader_.reset(nullptr);
     file_.reset(nullptr);
-    return Status::OK();
+    return absl::OkStatus();
   }
 
-  Status ReadLocked(string* key, string* value, bool* produced,
-                    bool* at_end) override {
-    *key = strings::StrCat(current_work(), ":", offset_);
-    Status status = reader_->ReadRecord(&offset_, value);
-    if (errors::IsOutOfRange(status)) {
+  absl::Status ReadLocked(tstring* key, tstring* value, bool* produced,
+                          bool* at_end) override {
+    *key = absl::StrCat(current_work(), ":", offset_);
+    absl::Status status = reader_->ReadRecord(&offset_, value);
+    if (absl::IsOutOfRange(status)) {
       *at_end = true;
-      return Status::OK();
+      return absl::OkStatus();
     }
     if (!status.ok()) return status;
     *produced = true;
-    return Status::OK();
+    return absl::OkStatus();
   }
 
-  Status ResetLocked() override {
+  absl::Status ResetLocked() override {
     offset_ = 0;
     reader_.reset(nullptr);
     file_.reset(nullptr);
@@ -71,9 +76,10 @@ class TFRecordReader : public ReaderBase {
 
  private:
   Env* const env_;
-  uint64 offset_;
+  uint64_t offset_;
   std::unique_ptr<RandomAccessFile> file_;
   std::unique_ptr<io::RecordReader> reader_;
+  std::string compression_type_ = "";
 };
 
 class TFRecordReaderOp : public ReaderOpKernel {
@@ -81,11 +87,20 @@ class TFRecordReaderOp : public ReaderOpKernel {
   explicit TFRecordReaderOp(OpKernelConstruction* context)
       : ReaderOpKernel(context) {
     Env* env = context->env();
-    SetReaderFactory([this, env]() { return new TFRecordReader(name(), env); });
+
+    std::string compression_type;
+    OP_REQUIRES_OK(context,
+                   context->GetAttr("compression_type", &compression_type));
+
+    SetReaderFactory([this, compression_type, env]() {
+      return new TFRecordReader(name(), compression_type, env);
+    });
   }
 };
 
 REGISTER_KERNEL_BUILDER(Name("TFRecordReader").Device(DEVICE_CPU),
+                        TFRecordReaderOp);
+REGISTER_KERNEL_BUILDER(Name("TFRecordReaderV2").Device(DEVICE_CPU),
                         TFRecordReaderOp);
 
 }  // namespace tensorflow

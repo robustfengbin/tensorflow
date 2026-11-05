@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,10 +16,17 @@ limitations under the License.
 #include "tensorflow/core/kernels/cwise_ops_common.h"
 
 namespace tensorflow {
-REGISTER4(BinaryOp, CPU, "Maximum", functor::maximum, float, double, int32,
-          int64);
-#if GOOGLE_CUDA
-REGISTER3(BinaryOp, GPU, "Maximum", functor::maximum, float, double, int64);
+REGISTER4(BinaryOp, CPU, "Maximum", functor::maximum, float, Eigen::half,
+          bfloat16, double);
+REGISTER8(BinaryOp, CPU, "Maximum", functor::maximum, int8_t, uint8_t, int16_t,
+          uint16_t, int32_t, uint32_t, int64_t, uint64_t);
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+#if !defined(MLIR_GENERATED_GPU_KERNELS_ENABLED)
+REGISTER6(BinaryOp, GPU, "Maximum", functor::maximum, float, Eigen::half,
+          double, uint8, int16, int64);
+#endif
+
+REGISTER(BinaryOp, GPU, "Maximum", functor::maximum, bfloat16);
 
 // A special GPU kernel for int32.
 // TODO(b/25387198): Also enable int32 in device memory. This kernel
@@ -29,8 +36,15 @@ REGISTER_KERNEL_BUILDER(Name("Maximum")
                             .HostMemory("x")
                             .HostMemory("y")
                             .HostMemory("z")
-                            .TypeConstraint<int32>("T"),
-                        BinaryOp<CPUDevice, functor::maximum<int32>>);
+                            .TypeConstraint<int32_t>("T"),
+                        BinaryOp<CPUDevice, functor::maximum<int32_t>>);
 #endif
+REGISTER_KERNEL_BUILDER(Name("Maximum")
+                            .Device(DEVICE_DEFAULT)
+                            .HostMemory("x")
+                            .HostMemory("y")
+                            .HostMemory("z")
+                            .TypeConstraint<int32_t>("T"),
+                        BinaryOp<CPUDevice, functor::maximum<int32_t>>);
 
 }  // namespace tensorflow

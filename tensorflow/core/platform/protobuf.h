@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,34 +13,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef TENSORFLOW_PLATFORM_PROTOBUF_H_
-#define TENSORFLOW_PLATFORM_PROTOBUF_H_
+#ifndef TENSORFLOW_CORE_PLATFORM_PROTOBUF_H_
+#define TENSORFLOW_CORE_PLATFORM_PROTOBUF_H_
 
 #include "tensorflow/core/platform/platform.h"
 #include "tensorflow/core/platform/types.h"
-
-// Import whatever namespace protobuf comes from into the
-// ::tensorflow::protobuf namespace.
-//
-// TensorFlow code should use the ::tensorflow::protobuf namespace to
-// refer to all protobuf APIs.
-
-#if defined(PLATFORM_GOOGLE)
-#include "tensorflow/core/platform/google/build_config/protobuf.h"
-#elif defined(PLATFORM_GOOGLE_ANDROID)
-#include "tensorflow/core/platform/google/build_config/protobuf_android.h"
-#else
-#include "tensorflow/core/platform/default/protobuf.h"
-#endif
+#include "tsl/platform/protobuf.h"
 
 namespace tensorflow {
-// Parses a protocol buffer contained in a string in the binary wire format.
-// Returns true on success. Note: Unlike protobuf's builtin ParseFromString,
-// this function has no size restrictions on the total size of the encoded
-// protocol buffer.
-bool ParseProtoUnlimited(protobuf::Message* proto, const string& serialized);
-bool ParseProtoUnlimited(protobuf::Message* proto, const void* serialized,
-                         size_t size);
+namespace protobuf = tsl::protobuf;  // NOLINT(misc-unused-alias-decls)
+// NOLINTBEGIN(misc-unused-using-decls)
+using tsl::kProtobufInt64Typename;
+using tsl::kProtobufUint64Typename;
+using tsl::ParseFromTString;
+using tsl::ParseProtoUnlimited;
+using tsl::protobuf_int64;
+using tsl::protobuf_uint64;
+using tsl::ProtobufStringToString;
+using tsl::SerializeToTString;
+using tsl::SetProtobufStringSwapAllowed;
+using tsl::TStringOutputStream;
+// NOLINTEND(misc-unused-using-decls)
 }  // namespace tensorflow
 
-#endif  // TENSORFLOW_PLATFORM_PROTOBUF_H_
+#endif  // TENSORFLOW_CORE_PLATFORM_PROTOBUF_H_

@@ -1,35 +1,89 @@
+# Copyright 2026 The TensorFlow Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 # Description:
-#   Tensorflow C++ inference example for labeling images.
+#   TensorFlow C++ inference example for labeling images.
 
-package(default_visibility = ["//tensorflow:internal"])
+load("@xla//third_party/rules_python/python:py_binary.bzl", "py_binary")
+load("//tensorflow:tensorflow.bzl", "tf_cc_binary")
 
-licenses(["notice"])  # Apache 2.0
+package(
+    # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
+    default_visibility = ["//tensorflow:internal"],
+    licenses = ["notice"],
+)
 
-exports_files(["LICENSE"])
+exports_files(["data/grace_hopper.jpg"])
 
-cc_binary(
+tf_cc_binary(
     name = "label_image",
     srcs = [
         "main.cc",
     ],
-    linkopts = ["-lm"],
-    deps = [
+    linkopts = select({
+        "//tensorflow:android": [
+            "-pie",
+            "-landroid",
+            "-ljnigraphics",
+            "-llog",
+            "-lm",
+            "-z defs",
+            "-s",
+            "-Wl,--exclude-libs,ALL",
+        ],
+        "//conditions:default": ["-lm"],
+    }),
+    deps = select({
+        "//tensorflow:android": [
+            "//tensorflow/core:portable_tensorflow_lib",
+            # cc:android_tensorflow_image_op is for including jpeg/gif/png
+            # decoder to enable real-image evaluation on Android
+            "//tensorflow/core/kernels/image:android_tensorflow_image_op",
+        ],
+        "//conditions:default": [
+            "//tensorflow/core:core_cpu",
+            "//tensorflow/core:framework",
+            "//tensorflow/core:framework_internal",
+            "//tensorflow/core:lib",
+            "//tensorflow/core:protos_all_cc",
+            "//tensorflow/core:tensorflow",
+        ],
+    }) + [
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+        "//tensorflow/cc:ops",
+        "//tensorflow/cc:scope",
+        "@xla//xla/tsl/util:command_line_flags",
+        "@xla//xla/tsl/platform:status",
+        "@xla//xla/tsl/platform:types",
+        # cc:cc_ops is used to include image ops (for label_image)
+        # Jpg, gif, and png related code won't be included
         "//tensorflow/cc:cc_ops",
-        "//tensorflow/core:framework_internal",
-        "//tensorflow/core:tensorflow",
     ],
 )
 
-filegroup(
-    name = "all_files",
-    srcs = glob(
-        ["**/*"],
-        exclude = [
-            "**/METADATA",
-            "**/OWNERS",
-            "bin/**",
-            "gen/**",
-        ],
-    ),
-    visibility = ["//tensorflow:__subpackages__"],
+py_binary(
+    name = "label_image_py",
+    srcs = ["label_image.py"],
+    main = "label_image.py",
+    strict_deps = True,
+    deps = [
+        "//tensorflow:tensorflow_py",
+        "//third_party/py/numpy",
+    ],
 )

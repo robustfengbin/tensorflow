@@ -1,5 +1,23 @@
+# Copyright 2026 The TensorFlow Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 # Description:
 # Platform-specific build configurations.
+
+load("//tensorflow:tensorflow.bzl", "tf_copts")
+load("//tensorflow/core/platform:rules_cc.bzl", "cc_library")
 
 package(default_visibility = ["//tensorflow:internal"])
 
@@ -7,16 +25,16 @@ licenses(["notice"])  # Apache 2.0
 
 exports_files(["LICENSE"])
 
-load("//tensorflow:tensorflow.bzl", "tf_copts")
-load("//tensorflow:tensorflow.bzl", "tf_cuda_library")
-load("//tensorflow/core:platform/default/build_config.bzl", "tf_get_cuda_version")
-
 cc_library(
-    name = "gtest",
-    testonly = 1,
+    name = "platformlib",
     copts = tf_copts(),
     deps = [
-        "//external:gtest",
+        "//tensorflow/core:protos_all_cc",
+        "@com_googlesource_code_re2//:re2",
+        "@farmhash_archive//:farmhash",
+        "@fft2d",
+        "@highwayhash//:sip_hash",
+        "@zlib",
     ],
 )
 
@@ -27,66 +45,9 @@ cc_library(
     deps = [],
 )
 
-tf_cuda_library(
-    name = "stream_executor",
-    deps = [
-        "//tensorflow/stream_executor",
-    ],
-)
-
-cc_library(
-    name = "platformlib",
-    copts = tf_copts(),
-    deps = [
-        "@jpeg_archive//:jpeg",
-        "@png_archive//:png",
-        "@re2//:re2",
-        "//tensorflow/core:protos_cc",
-    ],
-)
-
-cc_library(
-    name = "protos_cc",
-    copts = tf_copts(),
-    deps = [
-        "//tensorflow/core:protos_all_cc",
-    ],
-)
-
 cc_library(
     name = "test_main",
     testonly = 1,
     linkstatic = 1,
     deps = [],
-)
-
-filegroup(
-    name = "android_proto_lib_portable_proto",
-    srcs = [],
-    visibility = ["//visibility:public"],
-)
-
-cc_library(
-    name = "cuda",
-    data = [
-        "//third_party/gpus/cuda:lib64/libcudart.so" + tf_get_cuda_version(),
-    ],
-    linkopts = [
-        "-Wl,-rpath,third_party/gpus/cuda/lib64",
-    ],
-    deps = [
-        "//third_party/gpus/cuda:cudart",
-    ],
-)
-
-filegroup(
-    name = "all_files",
-    srcs = glob(
-        ["**/*"],
-        exclude = [
-            "**/METADATA",
-            "**/OWNERS",
-        ],
-    ),
-    visibility = ["//tensorflow:__subpackages__"],
 )

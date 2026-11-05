@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,11 +16,18 @@ limitations under the License.
 #include "tensorflow/core/kernels/cwise_ops_common.h"
 
 namespace tensorflow {
-REGISTER7(BinaryOp, CPU, "Greater", functor::greater, float, double, int32,
-          int64, uint8, int8, int16);
-#if GOOGLE_CUDA
-REGISTER6(BinaryOp, GPU, "Greater", functor::greater, float, double, int64,
-          uint8, int8, int16);
+REGISTER9(BinaryOp, CPU, "Greater", functor::greater, float, Eigen::half,
+          double, int32_t, int64_t, uint8_t, uint16_t, uint32_t, uint64_t);
+REGISTER3(BinaryOp, CPU, "Greater", functor::greater, int8_t, int16_t,
+          bfloat16);
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+#if !defined(MLIR_GENERATED_GPU_KERNELS_ENABLED)
+REGISTER6(BinaryOp, GPU, "Greater", functor::greater, float, Eigen::half,
+          double, int8, int16, int64);
+REGISTER4(BinaryOp, GPU, "Greater", functor::greater, uint8, uint16, uint32,
+          uint64);
+#endif
+REGISTER(BinaryOp, GPU, "Greater", functor::greater, bfloat16);
 
 // A special GPU kernel for int32.
 // TODO(b/25387198): Also enable int32 in device memory. This kernel
@@ -30,8 +37,14 @@ REGISTER_KERNEL_BUILDER(Name("Greater")
                             .HostMemory("x")
                             .HostMemory("y")
                             .HostMemory("z")
-                            .TypeConstraint<int32>("T"),
-                        BinaryOp<CPUDevice, functor::greater<int32>>);
+                            .TypeConstraint<int32_t>("T"),
+                        BinaryOp<CPUDevice, functor::greater<int32_t>>);
 #endif
-
+REGISTER_KERNEL_BUILDER(Name("Greater")
+                            .Device(DEVICE_DEFAULT)
+                            .HostMemory("x")
+                            .HostMemory("y")
+                            .HostMemory("z")
+                            .TypeConstraint<int32_t>("T"),
+                        BinaryOp<CPUDevice, functor::greater<int32_t>>);
 }  // namespace tensorflow

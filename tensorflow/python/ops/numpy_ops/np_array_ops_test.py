@@ -1,0 +1,2116 @@
+# Copyright 2020 The TensorFlow Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""Tests for tf numpy array methods."""
+
+import itertools
+import operator
+import sys
+
+from absl.testing import parameterized
+import numpy as np
+
+from tensorflow.python.eager import backprop
+from tensorflow.python.eager import context
+from tensorflow.python.eager import def_function
+from tensorflow.python.framework import config
+from tensorflow.python.framework import constant_op
+from tensorflow.python.framework import dtypes
+from tensorflow.python.framework import errors_impl
+from tensorflow.python.framework import indexed_slices
+from tensorflow.python.framework import ops
+from tensorflow.python.framework import random_seed
+from tensorflow.python.framework import tensor_shape
+from tensorflow.python.framework import tensor_spec
+from tensorflow.python.framework import test_util
+from tensorflow.python.ops import array_ops
+from tensorflow.python.ops import math_ops
+from tensorflow.python.ops.numpy_ops import np_array_ops
+from tensorflow.python.ops.numpy_ops import np_arrays
+from tensorflow.python.ops.numpy_ops import np_math_ops
+from tensorflow.python.platform import test
+
+
+_virtual_devices_ready = False
+
+
+def set_up_virtual_devices():
+  global _virtual_devices_ready
+  if _virtual_devices_ready:
+    return
+  physical_devices = config.list_physical_devices('CPU')
+  config.set_logical_device_configuration(
+      physical_devices[0], [
+          context.LogicalDeviceConfiguration(),
+          context.LogicalDeviceConfiguration()
+      ])
+  _virtual_devices_ready = True
+
+
+class ArrayCreationTest(test.TestCase):
+
+  def setUp(self):
+    super(ArrayCreationTest, self).setUp()
+    set_up_virtual_devices()
+    python_shapes = [
+        0, 1, 2, (), (1,), (2,), (1, 2, 3), [], [1], [2], [1, 2, 3]
+    ]
+    self.shape_transforms = [
+        lambda x: x, lambda x: np.array(x, dtype=int),
+        lambda x: np_array_ops.array(x, dtype=int), tensor_shape.TensorShape
+    ]
+
+    self.all_shapes = []
+    for fn in self.shape_transforms:
+      self.all_shapes.extend([fn(s) for s in python_shapes])
+
+    if sys.version_info.major == 3:
+      # There is a bug of np.empty (and alike) in Python 3 causing a crash when
+      # the `shape` argument is an np_arrays.ndarray scalar (or tf.Tensor
+      # scalar).
+      def not_ndarray_scalar(s):
+        return not (isinstance(s, np_arrays.ndarray) and s.ndim == 0)
+
+      self.all_shapes = list(filter(not_ndarray_scalar, self.all_shapes))
+
+    self.all_types = [
+        int, float, np.int16, np.int32, np.int64, np.float16, np.float32,
+        np.float64, np.complex64, np.complex128
+    ]
+
+    source_array_data = [
+        1,
+        5.5,
+        7,
+        (),
+        (8, 10.),
+        ((), ()),
+        ((1, 4), (2, 8)),
+        [],
+        [7],
+        [8, 10.],
+        [[], []],
+        [[1, 4], [2, 8]],
+        ([], []),
+        ([1, 4], [2, 8]),
+        [(), ()],
+        [(1, 4), (2, 8)],
+    ]
+
+    self.array_transforms = [
+        lambda x: x,
+        ops.convert_to_tensor,
+        np.array,
+        np_array_ops.array,
+    ]
+    self.all_arrays = []
+    for fn in self.array_transforms:
+      self.all_arrays.extend([fn(s) for s in source_array_data])
+
+  def testEmpty(self):
+    for s in self.all_shapes:
+      actual = np_array_ops.empty(s)
+      expected = np.empty(s)
+      msg = 'shape: {}'.format(s)
+      self.match_shape(actual, expected, msg)
+      self.match_dtype(actual, expected, msg)
+
+    for s, t in itertools.product(self.all_shapes, self.all_types):
+      actual = np_array_ops.empty(s, t)
+      expected = np.empty(s, t)
+      msg = 'shape: {}, dtype: {}'.format(s, t)
+      self.match_shape(actual, expected, msg)
+      self.match_dtype(actual, expected, msg)
+
+  def testEmptyLike(self):
+    for a in self.all_arrays:
+      actual = np_array_ops.empty_like(a)
+      expected = np.empty_like(a)
+      msg = 'array: {}'.format(a)
+      self.match_shape(actual, expected, msg)
+      self.match_dtype(actual, expected, msg)
+
+    for a, t in itertools.product(self.all_arrays, self.all_types):
+      actual = np_array_ops.empty_like(a, t)
+      expected = np.empty_like(a, t)
+      msg = 'array: {} type: {}'.format(a, t)
+      self.match_shape(actual, expected, msg)
+      self.match_dtype(actual, expected, msg)
+
+  def testZeros(self):
+    for s in self.all_shapes:
+      actual = np_array_ops.zeros(s)
+      expected = np.zeros(s)
+      msg = 'shape: {}'.format(s)
+      self.match(actual, expected, msg)
+
+    for s, t in itertools.product(self.all_shapes, self.all_types):
+      actual = np_array_ops.zeros(s, t)
+      expected = np.zeros(s, t)
+      msg = 'shape: {}, dtype: {}'.format(s, t)
+      self.match(actual, expected, msg)
+
+  def testZerosLike(self):
+    for a in self.all_arrays:
+      actual = np_array_ops.zeros_like(a)
+      expected = np.zeros_like(a)
+      msg = 'array: {}'.format(a)
+      self.match(actual, expected, msg)
+
+    for a, t in itertools.product(self.all_arrays, self.all_types):
+      actual = np_array_ops.zeros_like(a, t)
+      expected = np.zeros_like(a, t)
+      msg = 'array: {} type: {}'.format(a, t)
+      self.match(actual, expected, msg)
+
+  def testOnes(self):
+    for s in self.all_shapes:
+      actual = np_array_ops.ones(s)
+      expected = np.ones(s)
+      msg = 'shape: {}'.format(s)
+      self.match(actual, expected, msg)
+
+    for s, t in itertools.product(self.all_shapes, self.all_types):
+      actual = np_array_ops.ones(s, t)
+      expected = np.ones(s, t)
+      msg = 'shape: {}, dtype: {}'.format(s, t)
+      self.match(actual, expected, msg)
+
+  def testOnesLike(self):
+    for a in self.all_arrays:
+      actual = np_array_ops.ones_like(a)
+      expected = np.ones_like(a)
+      msg = 'array: {}'.format(a)
+      self.match(actual, expected, msg)
+
+    for a, t in itertools.product(self.all_arrays, self.all_types):
+      actual = np_array_ops.ones_like(a, t)
+      expected = np.ones_like(a, t)
+      msg = 'array: {} type: {}'.format(a, t)
+      self.match(actual, expected, msg)
+
+  def testEye(self):
+    n_max = 3
+    m_max = 3
+
+    for n in range(1, n_max + 1):
+      self.match(np_array_ops.eye(n), np.eye(n))
+      for k in range(-n, n + 1):
+        self.match(np_array_ops.eye(n, k=k), np.eye(n, k=k))
+      for m in range(1, m_max + 1):
+        self.match(np_array_ops.eye(n, m), np.eye(n, m))
+        for k in range(-n, m):
+          self.match(np_array_ops.eye(n, k=k), np.eye(n, k=k))
+          self.match(np_array_ops.eye(n, m, k), np.eye(n, m, k))
+
+    for dtype in self.all_types:
+      for n in range(1, n_max + 1):
+        self.match(np_array_ops.eye(n, dtype=dtype), np.eye(n, dtype=dtype))
+        for k in range(-n, n + 1):
+          self.match(
+              np_array_ops.eye(n, k=k, dtype=dtype),
+              np.eye(n, k=k, dtype=dtype))
+        for m in range(1, m_max + 1):
+          self.match(
+              np_array_ops.eye(n, m, dtype=dtype), np.eye(n, m, dtype=dtype))
+          for k in range(-n, m):
+            self.match(
+                np_array_ops.eye(n, k=k, dtype=dtype),
+                np.eye(n, k=k, dtype=dtype))
+            self.match(
+                np_array_ops.eye(n, m, k, dtype=dtype),
+                np.eye(n, m, k, dtype=dtype))
+
+    # Test M=0 and N=0 zero-dimension edge cases
+    for n in (0, 1, 3):
+      for m in (0, 1, 3):
+        self.match(np_array_ops.eye(n, m), np.eye(n, m))
+        for k in range(-n - 1, m + 2):
+          self.match(np_array_ops.eye(n, m, k), np.eye(n, m, k))
+
+  def testIdentity(self):
+    n_max = 3
+
+    for n in range(1, n_max + 1):
+      self.match(np_array_ops.identity(n), np.identity(n))
+
+    for dtype in self.all_types:
+      for n in range(1, n_max + 1):
+        self.match(
+            np_array_ops.identity(n, dtype=dtype), np.identity(n, dtype=dtype))
+
+  def testFull(self):
+    # List of 2-tuples of fill value and shape.
+    data = [
+        (5, ()),
+        (5, (7,)),
+        (5., (7,)),
+        ([5, 8], (2,)),
+        ([5, 8], (3, 2)),
+        ([[5], [8]], (2, 3)),
+        ([[5], [8]], (3, 2, 5)),
+        ([[5.], [8.]], (3, 2, 5)),
+        ([[3, 4], [5, 6], [7, 8]], (3, 3, 2)),
+    ]
+    for f, s in data:
+      for fn1, fn2 in itertools.product(self.array_transforms,
+                                        self.shape_transforms):
+        fill_value = fn1(f)
+        shape = fn2(s)
+        self.match(
+            np_array_ops.full(shape, fill_value), np.full(shape, fill_value))
+        for dtype in self.all_types:
+          self.match(
+              np_array_ops.full(shape, fill_value, dtype=dtype),
+              np.full(shape, fill_value, dtype=dtype))
+
+  def testFullLike(self):
+    # List of 2-tuples of fill value and shape.
+    data = [
+        (5, ()),
+        (5, (7,)),
+        (5., (7,)),
+        ([5, 8], (2,)),
+        ([5, 8], (3, 2)),
+        ([[5], [8]], (2, 3)),
+        ([[5], [8]], (3, 2, 5)),
+        ([[5.], [8.]], (3, 2, 5)),
+    ]
+    zeros_builders = [np_array_ops.zeros, np.zeros]
+    for f, s in data:
+      for fn1, fn2, arr_dtype in itertools.product(self.array_transforms,
+                                                   zeros_builders,
+                                                   self.all_types):
+        fill_value = fn1(f)
+        arr = fn2(s, arr_dtype)
+        self.match(
+            np_array_ops.full_like(arr, fill_value),
+            np.full_like(arr, fill_value))
+        for dtype in self.all_types:
+          self.match(
+              np_array_ops.full_like(arr, fill_value, dtype=dtype),
+              np.full_like(arr, fill_value, dtype=dtype))
+
+  def testArray(self):
+    ndmins = [0, 1, 2, 5]
+    for a, dtype, ndmin, copy in itertools.product(self.all_arrays,
+                                                   self.all_types, ndmins,
+                                                   [True, False]):
+      self.match(
+          np_array_ops.array(a, dtype=dtype, ndmin=ndmin, copy=copy),
+          np.array(a, dtype=dtype, ndmin=ndmin))
+
+    zeros_list = np_array_ops.zeros(5)
+
+    def test_copy_equal_false():
+      # Backing tensor is the same if copy=False, other attributes being None.
+      self.assertIs(np_array_ops.array(zeros_list, copy=False), zeros_list)
+      self.assertIs(np_array_ops.array(zeros_list, copy=False), zeros_list)
+
+      # Backing tensor is different if ndmin is not satisfied.
+      self.assertIsNot(
+          np_array_ops.array(zeros_list, copy=False, ndmin=2),
+          zeros_list)
+      self.assertIsNot(
+          np_array_ops.array(zeros_list, copy=False, ndmin=2),
+          zeros_list)
+      self.assertIs(
+          np_array_ops.array(zeros_list, copy=False, ndmin=1),
+          zeros_list)
+      self.assertIs(
+          np_array_ops.array(zeros_list, copy=False, ndmin=1),
+          zeros_list)
+
+      # Backing tensor is different if dtype is not satisfied.
+      self.assertIsNot(
+          np_array_ops.array(zeros_list, copy=False, dtype=int),
+          zeros_list)
+      self.assertIsNot(
+          np_array_ops.array(zeros_list, copy=False, dtype=int),
+          zeros_list)
+      self.assertIs(
+          np_array_ops.array(zeros_list, copy=False, dtype=float),
+          zeros_list)
+      self.assertIs(
+          np_array_ops.array(zeros_list, copy=False, dtype=float),
+          zeros_list)
+
+    test_copy_equal_false()
+    with ops.device('CPU:1'):
+      test_copy_equal_false()
+
+    self.assertNotIn('CPU:1', zeros_list.backing_device)
+    with ops.device('CPU:1'):
+      self.assertIn(
+          'CPU:1', np_array_ops.array(zeros_list, copy=True).backing_device)
+      self.assertIn(
+          'CPU:1', np_array_ops.array(np.array(0), copy=True).backing_device)
+
+  def testAsArray(self):
+    for a, dtype in itertools.product(self.all_arrays, self.all_types):
+      self.match(
+          np_array_ops.asarray(a, dtype=dtype), np.asarray(a, dtype=dtype))
+
+    zeros_list = np_array_ops.zeros(5)
+    # Same instance is returned if no dtype is specified and input is ndarray.
+    self.assertIs(np_array_ops.asarray(zeros_list), zeros_list)
+    with ops.device('CPU:1'):
+      self.assertIs(np_array_ops.asarray(zeros_list), zeros_list)
+    # Different instance is returned if dtype is specified and input is ndarray.
+    self.assertIsNot(np_array_ops.asarray(zeros_list, dtype=int), zeros_list)
+
+  def testAsAnyArray(self):
+    for a, dtype in itertools.product(self.all_arrays, self.all_types):
+      self.match(
+          np_array_ops.asanyarray(a, dtype=dtype),
+          np.asanyarray(a, dtype=dtype))
+    zeros_list = np_array_ops.zeros(5)
+    # Same instance is returned if no dtype is specified and input is ndarray.
+    self.assertIs(np_array_ops.asanyarray(zeros_list), zeros_list)
+    with ops.device('CPU:1'):
+      self.assertIs(np_array_ops.asanyarray(zeros_list), zeros_list)
+    # Different instance is returned if dtype is specified and input is ndarray.
+    self.assertIsNot(np_array_ops.asanyarray(zeros_list, dtype=int), zeros_list)
+
+  def testAsContiguousArray(self):
+    for a, dtype in itertools.product(self.all_arrays, self.all_types):
+      self.match(
+          np_array_ops.ascontiguousarray(a, dtype=dtype),
+          np.ascontiguousarray(a, dtype=dtype))
+
+  def testARangeFloatStep(self):
+    for args, kwargs in [
+        ((0.0, 1.0), dict(step=0.3)),
+        ((0.0, 5.0), dict(step=1.5)),
+        ((2.0, -3.0), dict(step=-0.75)),
+    ]:
+      self.assertAllEqual(
+          np_array_ops.arange(*args, **kwargs), np.arange(*args, **kwargs)
+      )
+    self.assertAllEqual(
+        np_array_ops.arange(2.0, -3.0, step=-0.75, dtype=np.float32),
+        np.arange(2.0, -3.0, step=-0.75, dtype=np.float32),
+    )
+
+  def testARange(self):
+    int_values = np.arange(-3, 3).tolist()
+    float_values = np.arange(-3.5, 3.5).tolist()
+    all_values = int_values + float_values
+    for dtype in self.all_types:
+      for start in all_values:
+        msg = 'dtype:{} start:{}'.format(dtype, start)
+        self.match(np_array_ops.arange(start), np.arange(start), msg=msg)
+        self.match(
+            np_array_ops.arange(start, dtype=dtype),
+            np.arange(start, dtype=dtype),
+            msg=msg)
+        for stop in all_values:
+          msg = 'dtype:{} start:{} stop:{}'.format(dtype, start, stop)
+          self.match(
+              np_array_ops.arange(start, stop), np.arange(start, stop), msg=msg)
+          # TODO(srbs): Investigate and remove check.
+          # There are some bugs when start or stop is float and dtype is int.
+          if not isinstance(start, float) and not isinstance(stop, float):
+            self.match(
+                np_array_ops.arange(start, stop, dtype=dtype),
+                np.arange(start, stop, dtype=dtype),
+                msg=msg)
+          # Note: We intentionally do not test with float values for step
+          # because numpy.arange itself returns inconsistent results. e.g.
+          # np.arange(0.5, 3, step=0.5, dtype=int) returns
+          # array([0, 1, 2, 3, 4])
+          for step in int_values:
+            msg = 'dtype:{} start:{} stop:{} step:{}'.format(
+                dtype, start, stop, step)
+            if not step:
+              with self.assertRaises(ValueError):
+                self.match(
+                    np_array_ops.arange(start, stop, step),
+                    np.arange(start, stop, step),
+                    msg=msg)
+                if not isinstance(start, float) and not isinstance(stop, float):
+                  self.match(
+                      np_array_ops.arange(start, stop, step, dtype=dtype),
+                      np.arange(start, stop, step, dtype=dtype),
+                      msg=msg)
+            else:
+              self.match(
+                  np_array_ops.arange(start, stop, step),
+                  np.arange(start, stop, step),
+                  msg=msg)
+              if not isinstance(start, float) and not isinstance(stop, float):
+                self.match(
+                    np_array_ops.arange(start, stop, step, dtype=dtype),
+                    np.arange(start, stop, step, dtype=dtype),
+                    msg=msg)
+
+  def testDiag(self):
+    array_transforms = [
+        lambda x: x,  # Identity,
+        ops.convert_to_tensor,
+        np.array,
+        lambda x: np.array(x, dtype=np.float32),
+        lambda x: np.array(x, dtype=np.float64),
+        np_array_ops.array,
+        lambda x: np_array_ops.array(x, dtype=np.float32),
+        lambda x: np_array_ops.array(x, dtype=np.float64)
+    ]
+
+    def run_test(arr):
+      for fn in array_transforms:
+        arr = fn(arr)
+        self.match(
+            np_array_ops.diag(arr), np.diag(arr), msg='diag({})'.format(arr))
+        for k in range(-3, 3):
+          self.match(
+              np_array_ops.diag(arr, k),
+              np.diag(arr, k),
+              msg='diag({}, k={})'.format(arr, k))
+
+    # 2-d arrays.
+    run_test(np.arange(9).reshape((3, 3)).tolist())
+    run_test(np.arange(6).reshape((2, 3)).tolist())
+    run_test(np.arange(6).reshape((3, 2)).tolist())
+    run_test(np.arange(3).reshape((1, 3)).tolist())
+    run_test(np.arange(3).reshape((3, 1)).tolist())
+    run_test([[5]])
+    run_test([[]])
+    run_test([[], []])
+
+    # 1-d arrays.
+    run_test([])
+    run_test([1])
+    run_test([1, 2])
+
+  def testDiagonal(self):
+    a = np.arange(24).reshape(2, 3, 4)
+    for fn in self.array_transforms:
+      arr = fn(a)
+      self.match(np_array_ops.diagonal(arr), np.diagonal(arr))
+      self.match(
+          np_array_ops.diagonal(arr, axis1=-1, axis2=-2),
+          np.diagonal(arr, axis1=-1, axis2=-2),
+      )
+      self.match(
+          np_array_ops.diagonal(arr, axis1=0, axis2=-1),
+          np.diagonal(arr, axis1=0, axis2=-1),
+      )
+    b = np.arange(6).reshape(2, 3)
+    for fn in self.array_transforms:
+      arr = fn(b)
+      self.match(np_array_ops.diagonal(arr), np.diagonal(arr))
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.diagonal(a, axis1=-7, axis2=0)
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.diagonal(a, axis1=0, axis2=5)
+    # NumPy raises for 0-d/1-d inputs too, with its own "diag requires"
+    # message before any per-axis checks.
+    with self.assertRaisesRegex(ValueError, 'at least two dimensions'):
+      np_array_ops.diagonal(np.array(5))
+    with self.assertRaisesRegex(ValueError, 'at least two dimensions'):
+      np_array_ops.diagonal(np.array([1, 2, 3]))
+    with self.assertRaisesRegex(
+        ValueError, r'axis1 and axis2 cannot be the same$'
+    ):
+      np_array_ops.diagonal(a, axis1=0, axis2=0)
+    # Mixed-sign duplicates normalize to the same axis.
+    with self.assertRaisesRegex(ValueError, 'cannot be the same'):
+      np_array_ops.diagonal(a, axis1=0, axis2=-3)
+    with self.assertRaisesRegex(ValueError, 'cannot be the same'):
+      np_array_ops.diagonal(a, axis1=-1, axis2=2)
+
+  def testDiagFlat(self):
+    array_transforms = [
+        lambda x: x,  # Identity,
+        ops.convert_to_tensor,
+        np.array,
+        lambda x: np.array(x, dtype=np.float32),
+        lambda x: np.array(x, dtype=np.float64),
+        np_array_ops.array,
+        lambda x: np_array_ops.array(x, dtype=np.float32),
+        lambda x: np_array_ops.array(x, dtype=np.float64)
+    ]
+
+    def run_test(arr):
+      for fn in array_transforms:
+        arr = fn(arr)
+        self.match(
+            np_array_ops.diagflat(arr),
+            np.diagflat(arr),
+            msg='diagflat({})'.format(arr))
+        for k in range(-3, 3):
+          self.match(
+              np_array_ops.diagflat(arr, k),
+              np.diagflat(arr, k),
+              msg='diagflat({}, k={})'.format(arr, k))
+
+    # 1-d arrays.
+    run_test([])
+    run_test([1])
+    run_test([1, 2])
+    # 2-d arrays.
+    run_test([[]])
+    run_test([[5]])
+    run_test([[], []])
+    run_test(np.arange(4).reshape((2, 2)).tolist())
+    run_test(np.arange(2).reshape((2, 1)).tolist())
+    run_test(np.arange(2).reshape((1, 2)).tolist())
+    # 3-d arrays
+    run_test(np.arange(8).reshape((2, 2, 2)).tolist())
+
+  def testDiagInvalidK(self):
+    v = [1, 2]
+    invalid_ks = [
+        [1, 2],
+        np.array([1, 2]),
+        constant_op.constant([1, 2]),
+    ]
+    for k in invalid_ks:
+      with self.assertRaises(ValueError):
+        np_array_ops.diag(v, k=k)
+
+  def testDiagFlatInvalidK(self):
+    v = [1, 2]
+    invalid_ks = [
+        [1, 2],
+        np.array([1, 2]),
+        constant_op.constant([1, 2]),
+    ]
+    for k in invalid_ks:
+      with self.assertRaises(ValueError):
+        np_array_ops.diagflat(v, k=k)
+
+  def match_shape(self, actual, expected, msg=None):
+    if msg:
+      msg = 'Shape match failed for: {}. Expected: {} Actual: {}'.format(
+          msg, expected.shape, actual.shape)
+    self.assertEqual(actual.shape, expected.shape, msg=msg)
+
+  def match_dtype(self, actual, expected, msg=None):
+    if msg:
+      msg = 'Dtype match failed for: {}. Expected: {} Actual: {}.'.format(
+          msg, expected.dtype, actual.dtype)
+    self.assertEqual(actual.dtype, expected.dtype, msg=msg)
+
+  def match(self, actual, expected, msg=None, almost=False, decimal=7):
+    msg_ = 'Expected: {} Actual: {}'.format(expected, actual)
+    if msg:
+      msg = '{} {}'.format(msg_, msg)
+    else:
+      msg = msg_
+    self.assertIsInstance(actual, np_arrays.ndarray)
+    self.match_dtype(actual, expected, msg)
+    self.match_shape(actual, expected, msg)
+    if not almost:
+      if not actual.shape.rank:
+        self.assertEqual(actual.tolist(), expected.tolist())
+      else:
+        self.assertSequenceEqual(actual.tolist(), expected.tolist())
+    else:
+      np.testing.assert_almost_equal(
+          actual.tolist(), expected.tolist(), decimal=decimal)
+
+  def testIndexedSlices(self):
+    dtype = dtypes.int64
+    iss = indexed_slices.IndexedSlices(
+        values=np_array_ops.ones([2, 3], dtype=dtype),
+        indices=constant_op.constant([1, 9]),
+        dense_shape=[10, 3])
+    a = np_array_ops.array(iss, copy=False)
+    expected = array_ops.scatter_nd([[1], [9]],
+                                    array_ops.ones([2, 3], dtype=dtype),
+                                    [10, 3])
+    self.assertAllEqual(expected, a)
+
+  def testVander(self):
+    tf_res = np_array_ops.vander([-1.0, 1.0], N=0, increasing=False)
+    np_res = np.vander(np.array([-1.0, 1.0]), N=0)
+    self.assertAllEqual(tf_res, np_res)
+
+  def testVanderGradientZeroInput(self):
+    # Regression test for GitHub issue #127227:
+    # vander produces NaN gradient when an input element is 0.0.
+    def target(t):
+      x = np_array_ops.stack([t + 1, -t + 2, 2 * t - 1, t / 2 + 3])
+      y = np_array_ops.vander(x, N=None, increasing=False)
+      return sum((4 * i + j + 1) * y[i, j] for i in range(4) for j in range(4))
+
+    t = constant_op.constant(2.0, dtype=dtypes.float64)
+    with backprop.GradientTape() as tape:
+      tape.watch(t)
+      loss = target(t)
+    grad = tape.gradient(loss, t)
+    self.assertAllClose(loss, 1576.0)
+    self.assertAllClose(grad, 1038.5)
+
+    # Direct zero input elements with increasing=False and increasing=True.
+    for increasing in [False, True]:
+      x = constant_op.constant([0.0, 2.0, -1.0], dtype=dtypes.float64)
+      with backprop.GradientTape() as tape:
+        tape.watch(x)
+        y = math_ops.reduce_sum(
+            np_array_ops.vander(x, N=4, increasing=increasing)
+        )
+      grad_x = tape.gradient(y, x)
+      # d/dx (1 + x + x^2 + x^3) = 1 + 2x + 3x^2 -> [1.0, 17.0, 2.0]
+      self.assertAllClose(grad_x, [1.0, 17.0, 2.0])
+
+    # N=1 edge case (only x^0 column).
+    x_n1 = constant_op.constant([0.0, 3.0], dtype=dtypes.float64)
+    with backprop.GradientTape() as tape:
+      tape.watch(x_n1)
+      y_n1 = math_ops.reduce_sum(np_array_ops.vander(x_n1, N=1))
+    self.assertAllClose(tape.gradient(y_n1, x_n1), [0.0, 0.0])
+
+
+class ArrayMethodsTest(test.TestCase):
+
+  def setUp(self):
+    super(ArrayMethodsTest, self).setUp()
+    set_up_virtual_devices()
+    self.array_transforms = [
+        lambda x: x,
+        ops.convert_to_tensor,
+        np.array,
+        np_array_ops.array,
+    ]
+
+  def testAllAny(self):
+
+    def run_test(arr, *args, **kwargs):
+      for fn in self.array_transforms:
+        arr = fn(arr)
+        self.match(
+            np_array_ops.all(arr, *args, **kwargs),
+            np.all(arr, *args, **kwargs))
+        self.match(
+            np_array_ops.any(arr, *args, **kwargs),
+            np.any(arr, *args, **kwargs))
+
+    run_test(0)
+    run_test(1)
+    run_test([])
+    run_test([[True, False], [True, True]])
+    run_test([[True, False], [True, True]], axis=0)
+    run_test([[True, False], [True, True]], axis=0, keepdims=True)
+    run_test([[True, False], [True, True]], axis=1)
+    run_test([[True, False], [True, True]], axis=1, keepdims=True)
+    run_test([[True, False], [True, True]], axis=(0, 1))
+    run_test([[True, False], [True, True]], axis=(0, 1), keepdims=True)
+    run_test([5.2, 3.5], axis=0)
+    run_test([1, 0], axis=0)
+    run_test([-3j, 0j])
+    run_test([[1j, 2 + 0j], [0j, 1 - 1j]], axis=1)
+
+  def testComplexToBool(self):
+    # A complex value is true if its real or imaginary part is nonzero.
+    x = np.array([[-3j, 0j], [2 + 0j, 1 - 1j]], np.complex128)
+    expected = x.astype(bool)
+    for a in [x, x.tolist(), ops.convert_to_tensor(x), np_array_ops.array(x)]:
+      self.assertAllEqual(expected, np_array_ops.asarray(a, dtype=bool))
+      if hasattr(a, 'astype'):
+        self.assertAllEqual(expected, a.astype(bool))
+      self.assertAllEqual(np.nonzero(x), np_array_ops.nonzero(a))
+      self.assertAllEqual(np.where(x), np_array_ops.where(a))
+      self.assertAllEqual(
+          np.compress(x[0], [1, 2]), np_array_ops.compress(a[0], [1, 2])
+      )
+      self.assertAllEqual(np.logical_not(x), np_math_ops.logical_not(a))
+
+  def testCompress(self):
+
+    def run_test(condition, arr, *args, **kwargs):
+      for fn1 in self.array_transforms:
+        for fn2 in self.array_transforms:
+          arg1 = fn1(condition)
+          arg2 = fn2(arr)
+          self.match(
+              np_array_ops.compress(arg1, arg2, *args, **kwargs),
+              np.compress(
+                  np.asarray(arg1).astype(np.bool_), arg2, *args, **kwargs))
+
+    run_test([True], 5)
+    run_test([False], 5)
+    run_test([], 5)
+    run_test([True, False, True], [1, 2, 3])
+    run_test([True, False], [1, 2, 3])
+    run_test([False, True], [[1, 2], [3, 4]])
+    run_test([1, 0, 1], [1, 2, 3])
+    run_test([1, 0], [1, 2, 3])
+    run_test([0, 1], [[1, 2], [3, 4]])
+    run_test([True], [[1, 2], [3, 4]])
+    run_test([False, True], [[1, 2], [3, 4]], axis=1)
+    run_test([False, True], [[1, 2], [3, 4]], axis=0)
+    run_test([False, True], [[1, 2], [3, 4]], axis=-1)
+    run_test([False, True], [[1, 2], [3, 4]], axis=-2)
+    # Condition shorter than the compressed axis: `np.compress` ignores the
+    # trailing entries of `a`. Exercises the sliced (tightened-bound) path.
+    run_test([True, False, True], [1, 2, 3, 4, 5])
+    run_test([True], [1, 2, 3])
+    run_test([True, False], [[1, 2, 3], [4, 5, 6]], axis=1)
+    run_test([True], [[1, 2], [3, 4], [5, 6]], axis=0)
+
+  def testCompressOutOfBoundsAxis(self):
+    x = np_array_ops.array([[1, 2], [3, 4]])
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.compress([True, False], x, axis=-3)
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.compress([True, False], x, axis=2)
+
+  def testCompressJitCompile(self):
+    # Regression test for #122055: `compress` produced a dynamic size bounded by
+    # `a.shape[axis]` rather than `len(condition)`, so feeding its result into an
+    # op requiring a smaller static extent failed to compile under XLA even
+    # though eager execution succeeded. The condition is derived from the input
+    # so its selected count is data-dependent (not constant-folded away).
+    if not test_util.is_xla_enabled():
+      self.skipTest('XLA JIT compiler is not enabled in this test environment.')
+
+    def f(x):
+      condition = x[:3] > 0.0  # data-dependent, static length 3
+      compressed = np_array_ops.compress(
+          condition, x
+      )  # bounded by len 3, not 5
+      return array_ops.broadcast_to(compressed, [3])
+
+    x = np_array_ops.array([10.0, 20.0, 30.0, 40.0, 50.0])
+    expected = f(x)
+    got = def_function.function(f, jit_compile=True)(x)
+    self.assertAllEqual(got, expected)
+
+  def testCompressDynamicShape(self):
+    # #122563: under `@tf.function` with dynamic (`None`) dimensions,
+    # `condition.shape[0]` / `a.shape[axis]` are `None` and cannot be compared
+    # in Python. Tracing with an unknown-length signature must succeed (no
+    # `None` comparison error) and, from a single trace, match `np.compress`
+    # across equal, shorter, and longer condition lengths.
+    @def_function.function(
+        input_signature=[
+            tensor_spec.TensorSpec(shape=[None], dtype=dtypes.bool),
+            tensor_spec.TensorSpec(shape=[None], dtype=dtypes.float32),
+        ]
+    )
+    def f(condition, a):
+      return np_array_ops.compress(condition, a)
+
+    a = np.array([1.0, 2.0, 3.0, 4.0], np.float32)
+    # Equal length.
+    self.assertAllEqual(
+        f(np.array([True, False, True, False]), a),
+        np.compress([True, False, True, False], a),
+    )
+    # Condition shorter than `a`: trailing entries of `a` are dropped.
+    self.assertAllEqual(
+        f(np.array([True, False]), a), np.compress([True, False], a)
+    )
+    # Condition longer than `a` (extra entry is False, so still valid in numpy):
+    # the old code hit `boolean_mask`'s "Dimensions must be equal" error here.
+    a3 = np.array([1.0, 2.0, 3.0], np.float32)
+    self.assertAllEqual(
+        f(np.array([True, False, True, False]), a3),
+        np.compress([True, False, True, False], a3),
+    )
+
+  def testCopy(self):
+
+    def run_test(arr, *args, **kwargs):
+      for fn in self.array_transforms:
+        arg = fn(arr)
+        self.match(
+            np_array_ops.copy(arg, *args, **kwargs),
+            np.copy(arg, *args, **kwargs))
+
+    run_test([])
+    run_test([1, 2, 3])
+    run_test([1., 2., 3.])
+    run_test([True])
+    run_test(np.arange(9).reshape((3, 3)).tolist())
+
+    a = np_array_ops.asarray(0)
+    self.assertNotIn('CPU:1', a.backing_device)
+    with ops.device('CPU:1'):
+      self.assertIn('CPU:1', np_array_ops.array(a, copy=True)
+                    .backing_device)
+      self.assertIn('CPU:1', np_array_ops.array(np.array(0), copy=True)
+                    .backing_device)
+
+  def testCumProdAndSum(self):
+
+    def run_test(arr, *args, **kwargs):
+      for fn in self.array_transforms:
+        arg = fn(arr)
+        self.match(
+            np_array_ops.cumprod(arg, *args, **kwargs),
+            np.cumprod(arg, *args, **kwargs))
+        self.match(
+            np_array_ops.cumsum(arg, *args, **kwargs),
+            np.cumsum(arg, *args, **kwargs))
+
+    run_test([])
+    run_test([1, 2, 3])
+    run_test([1, 2, 3], dtype=float)
+    run_test([1, 2, 3], dtype=np.float32)
+    run_test([1, 2, 3], dtype=np.float64)
+    run_test([1., 2., 3.])
+    run_test([1., 2., 3.], dtype=int)
+    run_test([1., 2., 3.], dtype=np.int32)
+    run_test([1., 2., 3.], dtype=np.int64)
+    run_test([[1, 2], [3, 4]], axis=1)
+    run_test([[1, 2], [3, 4]], axis=0)
+    run_test([[1, 2], [3, 4]], axis=-1)
+    run_test([[1, 2], [3, 4]], axis=-2)
+
+  def testCumProdAndSumPromoteBool(self):
+    # NumPy accumulates booleans as integers.
+    for arr, kwargs in (
+        ([True, False, True], {}),
+        ([[True, True], [False, True]], {'axis': 0}),
+        ([[True, True], [False, True]], {'axis': 1}),
+        ([True, True], {'dtype': np.int32}),
+    ):
+      arg = np.array(arr)
+      self.match(np_array_ops.cumsum(arg, **kwargs), np.cumsum(arg, **kwargs))
+      self.match(np_array_ops.cumprod(arg, **kwargs), np.cumprod(arg, **kwargs))
+
+  def testCumProdAndSumOutOfBoundsAxis(self):
+    a = np_array_ops.array([[1, 2, 3], [4, 5, 6]])
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.cumsum(a, axis=2)
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.cumsum(a, axis=-3)
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.cumprod(a, axis=2)
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.cumprod(a, axis=-3)
+
+  def testImag(self):
+
+    def run_test(arr, *args, **kwargs):
+      for fn in self.array_transforms:
+        arg = fn(arr)
+        self.match(
+            np_array_ops.imag(arg, *args, **kwargs),
+            # np.imag may return a scalar so we convert to a np.ndarray.
+            np.array(np.imag(arg, *args, **kwargs)))
+
+    run_test(1)
+    run_test(5.5)
+    run_test(5 + 3j)
+    run_test(3j)
+    run_test([])
+    run_test([1, 2, 3])
+    run_test([True, False])
+    run_test([1 + 5j, 2 + 3j])
+    run_test([[1 + 5j, 2 + 3j], [1 + 7j, 2 + 8j]])
+
+  def testAMaxAMin(self):
+
+    def run_test(arr, *args, **kwargs):
+      axis = kwargs.pop('axis', None)
+      for fn1 in self.array_transforms:
+        for fn2 in self.array_transforms:
+          arr_arg = fn1(arr)
+          axis_arg = fn2(axis) if axis is not None else None
+          self.match(
+              np_array_ops.amax(arr_arg, axis=axis_arg, *args, **kwargs),
+              np.amax(arr_arg, axis=axis, *args, **kwargs))
+          self.match(
+              np_array_ops.amin(arr_arg, axis=axis_arg, *args, **kwargs),
+              np.amin(arr_arg, axis=axis, *args, **kwargs))
+
+    run_test([1, 2, 3])
+    run_test([1., 2., 3.])
+    run_test([[1, 2], [3, 4]], axis=1)
+    run_test([[1, 2], [3, 4]], axis=0)
+    run_test([[1, 2], [3, 4]], axis=-1)
+    run_test([[1, 2], [3, 4]], axis=-2)
+    run_test([[1, 2], [3, 4]], axis=(0, 1))
+    run_test(np.arange(8).reshape((2, 2, 2)).tolist(), axis=(0, 2))
+    run_test(
+        np.arange(8).reshape((2, 2, 2)).tolist(), axis=(0, 2), keepdims=True)
+    run_test(np.arange(8).reshape((2, 2, 2)).tolist(), axis=(2, 0))
+    run_test(
+        np.arange(8).reshape((2, 2, 2)).tolist(), axis=(2, 0), keepdims=True)
+    self.assertRaises(ValueError, np_array_ops.amax, np.ones([2, 2]), out=[])
+    self.assertRaises(ValueError, np_array_ops.amin, np.ones([2, 2]), out=[])
+
+  def testMean(self):
+
+    def run_test(arr, *args, **kwargs):
+      axis = kwargs.pop('axis', None)
+      for fn1 in self.array_transforms:
+        for fn2 in self.array_transforms:
+          arr_arg = fn1(arr)
+          axis_arg = fn2(axis) if axis is not None else None
+          self.match(
+              np_array_ops.mean(arr_arg, axis=axis_arg, *args, **kwargs),
+              np.mean(arr_arg, axis=axis, *args, **kwargs))
+
+    run_test([1, 2, 1])
+    run_test([1., 2., 1.])
+    run_test([1., 2., 1.], dtype=int)
+    run_test([[1, 2], [3, 4]], axis=1)
+    run_test([[1, 2], [3, 4]], axis=0)
+    run_test([[1, 2], [3, 4]], axis=-1)
+    run_test([[1, 2], [3, 4]], axis=-2)
+    run_test([[1, 2], [3, 4]], axis=(0, 1))
+    run_test(np.arange(8).reshape((2, 2, 2)).tolist(), axis=(0, 2))
+    run_test(
+        np.arange(8).reshape((2, 2, 2)).tolist(), axis=(0, 2), keepdims=True)
+    run_test(np.arange(8).reshape((2, 2, 2)).tolist(), axis=(2, 0))
+    run_test(
+        np.arange(8).reshape((2, 2, 2)).tolist(), axis=(2, 0), keepdims=True)
+    self.assertRaises(ValueError, np_array_ops.mean, np.ones([2, 2]), out=[])
+
+  def testStd(self):
+
+    def run_test(arr, *args, **kwargs):
+      axis = kwargs.pop('axis', None)
+      for fn1 in self.array_transforms:
+        for fn2 in self.array_transforms:
+          arr_arg = fn1(arr)
+          axis_arg = fn2(axis) if axis is not None else None
+          self.match(
+              np_array_ops.std(arr_arg, axis=axis_arg, *args, **kwargs),
+              np.std(arr_arg, axis=axis, *args, **kwargs))
+
+    run_test([1, 2, 1])
+    run_test([1., 2., 1.])
+    run_test([1.j, 2., 1.j])
+    run_test([[1, 2], [3, 4]], axis=1)
+    run_test([[1, 2], [3, 4]], axis=0)
+    run_test([[1, 2], [3, 4]], axis=-1)
+    run_test([[1, 2], [3, 4]], axis=-2)
+    run_test([[1, 2], [3, 4]], axis=(0, 1))
+    run_test(np.arange(8).reshape((2, 2, 2)).tolist(), axis=(0, 2))
+    run_test(
+        np.arange(8).reshape((2, 2, 2)).tolist(), axis=(0, 2), keepdims=True)
+    run_test(np.arange(8).reshape((2, 2, 2)).tolist(), axis=(2, 0))
+    run_test(
+        np.arange(8).reshape((2, 2, 2)).tolist(), axis=(2, 0), keepdims=True)
+
+  def testVar(self):
+
+    def run_test(arr, *args, **kwargs):
+      axis = kwargs.pop('axis', None)
+      for fn1 in self.array_transforms:
+        for fn2 in self.array_transforms:
+          arr_arg = fn1(arr)
+          axis_arg = fn2(axis) if axis is not None else None
+          self.match(
+              np_array_ops.var(arr_arg, axis=axis_arg, *args, **kwargs),
+              np.var(arr_arg, axis=axis, *args, **kwargs))
+
+    run_test([1, 2, 1])
+    run_test([1., 2., 1.])
+    run_test([1.j, 2., 1.j])
+    run_test([1., 2., 1.], dtype=np.int64)
+    run_test([[1, 2], [3, 4]], axis=1)
+    run_test([[1, 2], [3, 4]], axis=0)
+    run_test([[1, 2], [3, 4]], axis=-1)
+    run_test([[1, 2], [3, 4]], axis=-2)
+    run_test([[1, 2], [3, 4]], axis=(0, 1))
+    run_test([1.0, 2.0, 3.0], ddof=1)
+    run_test([1.0, 2.0, 3.0], ddof=1, dtype=np.float64)
+    run_test([[1.0, 2.0], [3.0, 4.0]], axis=-1, ddof=1, keepdims=True)
+    run_test([1.0j, 2.0, 3.0j], ddof=1)
+    run_test([[1.0j, 2.0], [3.0j, 4.0]], axis=0, ddof=1)
+    run_test(np.arange(8.0).reshape((2, 2, 2)).tolist(), axis=(0, 2), ddof=1)
+    run_test(np.arange(8.0).reshape((2, 2, 2)).tolist(), axis=(-1, 0), ddof=1)
+    # A range of axes is static too.
+    self.match(
+        np_array_ops.var(
+            np.arange(8.0).reshape((2, 2, 2)), axis=range(2), ddof=1
+        ),
+        np.var(np.arange(8.0).reshape((2, 2, 2)), axis=(0, 1), ddof=1),
+    )
+    run_test(np.arange(8.0).reshape((2, 2, 2)).tolist(), axis=(), ddof=1)
+    run_test(5.0, ddof=1)
+    run_test(5.0, axis=(), ddof=1)
+    run_test(np.arange(8).reshape((2, 2, 2)).tolist(), axis=(0, 2))
+    run_test(
+        np.arange(8).reshape((2, 2, 2)).tolist(), axis=(0, 2), keepdims=True)
+    run_test(np.arange(8).reshape((2, 2, 2)).tolist(), axis=(2, 0))
+    run_test(
+        np.arange(8).reshape((2, 2, 2)).tolist(), axis=(2, 0), keepdims=True)
+
+    # Regression test: ddof >= n (the number of elements reduced over) must
+    # clamp the degrees-of-freedom denominator at 0 and match NumPy's `inf`,
+    # not silently divide by a negative count and return a wrong, finite,
+    # negative "variance". Also covers a non-integer ddof, which NumPy
+    # allows but which requires casting n to a float dtype before
+    # subtracting.
+    run_test([1.0, 2.0, 3.0], ddof=3)
+    run_test([1.0, 2.0, 3.0], ddof=4)
+    run_test([1.0, 2.0, 3.0], ddof=1.5)
+    run_test([], ddof=1)
+    run_test([5.0], ddof=1)
+    run_test([1.0, 2.0, 3.0], ddof=-1)
+    run_test(np.array([1.0 + 2.0j, 3.0 + 4.0j], dtype=np.complex64), ddof=2)
+    run_test([[1.0, 2.0], [3.0, 4.0]], axis=-1, ddof=2, keepdims=True)
+    run_test(np.arange(8.0).reshape((2, 2, 2)).tolist(), axis=0, ddof=2)
+    run_test(np.arange(8.0).reshape((2, 2, 2)).tolist(), axis=(0, 2), ddof=4)
+
+    # The same clamp must also apply under graph tracing with a dynamically
+    # shaped input, where `n` is computed by `array_ops.shape` at runtime
+    # rather than resolved statically.
+    @def_function.function(
+        input_signature=[
+            tensor_spec.TensorSpec(shape=[None], dtype=dtypes.float32)
+        ]
+    )
+    def dynamic_var(x):
+      return np_array_ops.var(x, ddof=3)
+
+    x_dyn = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    self.match(dynamic_var(x_dyn), np.var(x_dyn, ddof=3))
+
+    self.assertRaises(ValueError, np_array_ops.var, np.ones([2, 2]), out=[])
+    out_of_bounds = 'out of bounds|not in|Invalid reduction dimension'
+    for axis in (-3, (-3, 0), 3, (0, 3)):
+      with self.assertRaisesRegex(
+          (ValueError, errors_impl.InvalidArgumentError), out_of_bounds
+      ):
+        np_array_ops.var(np.ones([2, 2]), axis=axis, ddof=1)
+
+    # With an unknown rank, the axis is only checked at run time.
+    @def_function.function(
+        input_signature=[tensor_spec.TensorSpec(None, dtypes.float32)]
+    )
+    def var_fn(a):
+      return np_array_ops.var(a, axis=-3, ddof=1)
+
+    @def_function.function(
+        input_signature=[tensor_spec.TensorSpec(None, dtypes.float32)]
+    )
+    def var_fn_tuple(a):
+      return np_array_ops.var(a, axis=(-3, 0), ddof=1)
+
+    with self.assertRaisesRegex(
+        (ValueError, errors_impl.InvalidArgumentError), out_of_bounds
+    ):
+      var_fn(np.ones([2, 2], dtype=np.float32))
+    with self.assertRaisesRegex(
+        (ValueError, errors_impl.InvalidArgumentError), out_of_bounds
+    ):
+      var_fn_tuple(np.ones([2, 2], dtype=np.float32))
+
+    # In-bounds negative axes with an unknown rank are normalized at run time.
+    @def_function.function(
+        input_signature=[tensor_spec.TensorSpec(None, dtypes.float32)]
+    )
+    def var_fn_tuple_in_bounds(a):
+      return np_array_ops.var(a, axis=(-1, 0), ddof=1)
+
+    x = np.arange(24, dtype=np.float32).reshape((2, 3, 4))
+    self.match(var_fn_tuple_in_bounds(x), np.var(x, axis=(-1, 0), ddof=1))
+
+  def testProd(self):
+
+    def run_test(arr, *args, **kwargs):
+      for fn in self.array_transforms:
+        arg = fn(arr)
+        self.match(
+            np_array_ops.prod(arg, *args, **kwargs),
+            np.prod(arg, *args, **kwargs))
+
+    run_test([1, 2, 3])
+    run_test([1., 2., 3.])
+    run_test(np.array([1, 2, 3], dtype=np.int16))
+    run_test([[1, 2], [3, 4]], axis=1)
+    run_test([[1, 2], [3, 4]], axis=0)
+    run_test([[1, 2], [3, 4]], axis=-1)
+    run_test([[1, 2], [3, 4]], axis=-2)
+    run_test([[1, 2], [3, 4]], axis=(0, 1))
+    run_test(np.arange(8).reshape((2, 2, 2)).tolist(), axis=(0, 2))
+    run_test(
+        np.arange(8).reshape((2, 2, 2)).tolist(), axis=(0, 2), keepdims=True)
+    run_test(np.arange(8).reshape((2, 2, 2)).tolist(), axis=(2, 0))
+    run_test(
+        np.arange(8).reshape((2, 2, 2)).tolist(), axis=(2, 0), keepdims=True)
+
+  def _testReduce(self, math_fun, np_fun, name):
+    axis_transforms = [
+        lambda x: x,  # Identity,
+        ops.convert_to_tensor,
+        np.array,
+        np_array_ops.array,
+        lambda x: np_array_ops.array(x, dtype=np.float32),
+        lambda x: np_array_ops.array(x, dtype=np.float64),
+    ]
+
+    def run_test(a, **kwargs):
+      axis = kwargs.pop('axis', None)
+      for fn1 in self.array_transforms:
+        for fn2 in axis_transforms:
+          arg1 = fn1(a)
+          axis_arg = fn2(axis) if axis is not None else None
+          self.match(
+              math_fun(arg1, axis=axis_arg, **kwargs),
+              np_fun(arg1, axis=axis, **kwargs),
+              msg='{}({}, axis={}, keepdims={})'.format(name, arg1, axis,
+                                                        kwargs.get('keepdims')))
+
+    run_test(5)
+    run_test([2, 3])
+    run_test([[2, -3], [-6, 7]])
+    run_test([[2, -3], [-6, 7]], axis=0)
+    run_test([[2, -3], [-6, 7]], axis=0, keepdims=True)
+    run_test([[2, -3], [-6, 7]], axis=1)
+    run_test([[2, -3], [-6, 7]], axis=1, keepdims=True)
+    run_test([[2, -3], [-6, 7]], axis=(0, 1))
+    run_test([[2, -3], [-6, 7]], axis=(1, 0))
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      math_fun(np_array_ops.array([[2, -3], [-6, 7]]), axis=2)
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      math_fun(np_array_ops.array([[2, -3], [-6, 7]]), axis=-3)
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      math_fun(np_array_ops.array([[2, -3], [-6, 7]]), axis=(0, 2))
+
+  def testSum(self):
+    self._testReduce(np_array_ops.sum, np.sum, 'sum')
+    # Scalar input: axes -1 and 0 are in bounds, 1 and -2 are not.
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.sum(5, axis=1)
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.sum(5, axis=-2)
+
+  def testAmax(self):
+    self._testReduce(np_array_ops.amax, np.amax, 'amax')
+
+  def testSize(self):
+
+    def run_test(arr, axis=None):
+      onp_arr = np.array(arr)
+      self.assertEqual(np_array_ops.size(arr, axis), np.size(onp_arr, axis))
+
+    run_test(np_array_ops.array([1]))
+    run_test(np_array_ops.array([1, 2, 3, 4, 5]))
+    run_test(np_array_ops.ones((2, 3, 2)))
+    run_test(np_array_ops.ones((3, 2)))
+    run_test(np_array_ops.zeros((5, 6, 7)))
+    run_test(1)
+    run_test(np_array_ops.ones((3, 2, 1)))
+    run_test(constant_op.constant(5))
+    run_test(constant_op.constant([1, 1, 1]))
+    self.assertRaises(NotImplementedError, np_array_ops.size, np.ones((2, 2)),
+                      1)
+
+    @def_function.function(input_signature=[
+        tensor_spec.TensorSpec(dtype=dtypes.float64, shape=None)])
+    def f(arr):
+      arr = np_array_ops.asarray(arr)
+      return np_array_ops.size(arr)
+
+    self.assertEqual(f(np_array_ops.ones((3, 2))).numpy(), 6)
+
+  def testRavel(self):
+
+    def run_test(arr, *args, **kwargs):
+      for fn in self.array_transforms:
+        arg = fn(arr)
+        self.match(
+            np_array_ops.ravel(arg, *args, **kwargs),
+            np.ravel(arg, *args, **kwargs))
+
+    run_test(5)
+    run_test(5.)
+    run_test([])
+    run_test([[]])
+    run_test([[], []])
+    run_test([1, 2, 3])
+    run_test([1., 2., 3.])
+    run_test([[1, 2], [3, 4]])
+    run_test(np.arange(8).reshape((2, 2, 2)).tolist())
+
+  def testReal(self):
+
+    def run_test(arr, *args, **kwargs):
+      for fn in self.array_transforms:
+        arg = fn(arr)
+        self.match(
+            np_array_ops.real(arg, *args, **kwargs),
+            np.array(np.real(arg, *args, **kwargs)))
+
+    run_test(1)
+    run_test(5.5)
+    run_test(5 + 3j)
+    run_test(3j)
+    run_test([])
+    run_test([1, 2, 3])
+    run_test([True, False])
+    run_test([1 + 5j, 2 + 3j])
+    run_test([[1 + 5j, 2 + 3j], [1 + 7j, 2 + 8j]])
+
+  def testRepeat(self):
+
+    def run_test(arr, repeats, *args, **kwargs):
+      for fn1 in self.array_transforms:
+        for fn2 in self.array_transforms:
+          arr_arg = fn1(arr)
+          repeats_arg = fn2(repeats)
+          self.match(
+              np_array_ops.repeat(arr_arg, repeats_arg, *args, **kwargs),
+              np.repeat(arr_arg, repeats_arg, *args, **kwargs))
+
+    run_test(1, 2)
+    # NumPy treats 0-d inputs as 1-D of size 1, so axes -1 and 0 are
+    # valid on scalars.
+    run_test(5, 2, axis=0)
+    run_test(5, 2, axis=-1)
+    run_test([1, 2], 2)
+    run_test([1, 2], [2])
+    run_test([1, 2], [1, 2])
+    run_test([[1, 2], [3, 4]], 3, axis=0)
+    run_test([[1, 2], [3, 4]], 3, axis=1)
+    run_test([[1, 2], [3, 4]], [3], axis=0)
+    run_test([[1, 2], [3, 4]], [3], axis=1)
+    run_test([[1, 2], [3, 4]], [3, 2], axis=0)
+    run_test([[1, 2], [3, 4]], [3, 2], axis=1)
+    run_test([[1, 2], [3, 4]], [3, 2], axis=-1)
+    run_test([[1, 2], [3, 4]], [3, 2], axis=-2)
+
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.repeat([[1, 2], [3, 4]], 2, axis=2)
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.repeat([[1, 2], [3, 4]], 2, axis=-3)
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.repeat(np_array_ops.array(5), 2, axis=1)
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.repeat(np_array_ops.array(5), 2, axis=-2)
+
+  def testAround(self):
+
+    def run_test(arr, *args, **kwargs):
+      for fn in self.array_transforms:
+        arg = fn(arr)
+        self.match(
+            np_array_ops.around(arg, *args, **kwargs),
+            np.around(arg, *args, **kwargs))
+
+    run_test(5.5)
+    run_test(5.567, decimals=2)
+    run_test([])
+    run_test([1.27, 2.49, 2.75], decimals=1)
+    run_test([23.6, 45.1], decimals=-1)
+    run_test([5, 15, 25, 35, -25, 1234], decimals=-1)
+    run_test([5, 15, 25, 35, -25, 1234], decimals=-2)
+    run_test([123.456, -987.65], decimals=-2)
+
+  def testAroundNegativeDecimalsIsExact(self):
+    # 10**-1 is not representable in binary floating point, so the scaling
+    # has to divide by 10 rather than multiply by 0.1 to match NumPy exactly.
+    for dtype in (np.int32, np.int64, np.float32, np.float64):
+      arg = np.array([5, 15, 25, 35, -25, 1234], dtype=dtype)
+      for decimals in (-1, -2, -3):
+        self.assertAllEqual(
+            np_array_ops.around(arg, decimals), np.around(arg, decimals)
+        )
+    self.assertEqual(float(np_array_ops.around(123.456, -1)), 120.0)
+    self.assertEqual(
+        float(np_array_ops.around(0.123456789012, 11)),
+        np.around(0.123456789012, 11),
+    )
+
+  def testAroundHugeDecimals(self):
+    # `decimals` beyond the float exponent range must not overflow the
+    # scale factor or intermediate product.
+    for val in (1.5, 2.0):
+      self.assertEqual(float(np_array_ops.around(val, 400)), val)
+      self.assertEqual(float(np_array_ops.around(val, -400)), 0.0)
+    self.assertEqual(float(np_array_ops.around(1.2e308, -400)), 0.0)
+    self.assertEqual(int(np_array_ops.around(np.int64(12345), -400)), 0)
+    for dtype, exp in ((np.float32, 40), (np.float16, 5)):
+      x = dtype(2.5)
+      self.assertEqual(float(np_array_ops.around(x, exp)), 2.5)
+      self.assertEqual(float(np_array_ops.around(x, -exp)), 0.0)
+
+  def testAroundKeepsLargeIntegers(self):
+    # Integers are not converted to float when there is nothing to round, so
+    # values above 2**53 survive unchanged.
+    arg = np.array([2**53 + 1, -(2**62) - 1], dtype=np.int64)
+    for decimals in (0, 2):
+      self.assertAllEqual(np_array_ops.around(arg, decimals), arg)
+
+  def testReshape(self):
+
+    def run_test(arr, newshape, *args, **kwargs):
+      for fn1 in self.array_transforms:
+        for fn2 in self.array_transforms:
+          arr_arg = fn1(arr)
+          newshape_arg = fn2(newshape)
+          self.match(
+              np_array_ops.reshape(arr_arg, newshape_arg, *args, **kwargs),
+              np.reshape(arr_arg, newshape, *args, **kwargs))
+
+    run_test(5, [-1])
+    run_test([], [-1])
+    run_test([1, 2, 3], [1, 3])
+    run_test([1, 2, 3], [3, 1])
+    run_test([1, 2, 3, 4], [2, 2])
+    run_test([1, 2, 3, 4], [2, 1, 2])
+
+  def testExpandDims(self):
+
+    def run_test(arr, axis):
+      self.match(np_array_ops.expand_dims(arr, axis), np.expand_dims(arr, axis))
+
+    run_test([1, 2, 3], 0)
+    run_test([1, 2, 3], 1)
+    # Valid negative and boundary axes still work.
+    run_test([1, 2, 3], -1)
+    run_test([1, 2, 3], -2)
+    a = np.ones((2, 3))
+    # Assert exact boundary tests
+    run_test(a, -3)
+    run_test(a, 2)
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.expand_dims(a, 3)
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.expand_dims(a, -4)
+
+  def testSqueeze(self):
+
+    def run_test(arr, *args, **kwargs):
+      for fn in self.array_transforms:
+        arg = fn(arr)
+        # Note: np.squeeze ignores the axis arg for non-ndarray objects.
+        # This looks like a bug: https://github.com/numpy/numpy/issues/8201
+        # So we convert the arg to np.ndarray before passing to np.squeeze.
+        self.match(
+            np_array_ops.squeeze(arg, *args, **kwargs),
+            np.squeeze(np.array(arg), *args, **kwargs))
+
+    run_test(5)
+    run_test([])
+    run_test([5])
+    run_test([[1, 2, 3]])
+    run_test([[[1], [2], [3]]])
+    run_test([[[1], [2], [3]]], axis=0)
+    run_test([[[1], [2], [3]]], axis=2)
+    run_test([[[1], [2], [3]]], axis=(0, 2))
+    run_test([[[1], [2], [3]]], axis=-1)
+    run_test([[[1], [2], [3]]], axis=-3)
+
+  def testTranspose(self):
+
+    def run_test(arr, axes=None):
+      for fn1 in self.array_transforms:
+        for fn2 in self.array_transforms:
+          arr_arg = fn1(arr)
+          axes_arg = fn2(axes) if axes is not None else None
+          self.match(
+              np_array_ops.transpose(arr_arg, axes_arg),
+              np.transpose(arr_arg, axes))
+
+    run_test(5)
+    run_test([])
+    run_test([5])
+    run_test([5, 6, 7])
+    run_test(np.arange(30).reshape(2, 3, 5).tolist())
+    run_test(np.arange(30).reshape(2, 3, 5).tolist(), [0, 1, 2])
+    run_test(np.arange(30).reshape(2, 3, 5).tolist(), [0, 2, 1])
+    run_test(np.arange(30).reshape(2, 3, 5).tolist(), [1, 0, 2])
+    run_test(np.arange(30).reshape(2, 3, 5).tolist(), [1, 2, 0])
+    run_test(np.arange(30).reshape(2, 3, 5).tolist(), [2, 0, 1])
+    run_test(np.arange(30).reshape(2, 3, 5).tolist(), [2, 1, 0])
+    a = np.arange(6).reshape(2, 3)
+    # Valid negative and mixed axes still work.
+    self.match(np_array_ops.transpose(a, [0, -1]), np.transpose(a, [0, -1]))
+    self.match(np_array_ops.transpose(a, [-2, -1]), np.transpose(a, [-2, -1]))
+    with self.assertRaisesRegex(ValueError, "axes don't match array"):
+      np_array_ops.transpose(a, [0, 1, 2])
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.transpose(a, [0, 2])
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.transpose(a, [0, -3])
+    with self.assertRaisesRegex(ValueError, 'repeated axis'):
+      np_array_ops.transpose(a, [1, 1])
+    with self.assertRaisesRegex(ValueError, 'repeated axis'):
+      np_array_ops.transpose(a, [0, -2])
+    # Test scalar rank.
+    a_scalar = np.array(5)
+    self.match(np_array_ops.transpose(a_scalar, []), np.transpose(a_scalar, []))
+    with self.assertRaisesRegex(ValueError, "axes don't match array"):
+      np_array_ops.transpose(a_scalar, [0])
+    # Test vector rank.
+    a_vector = np.array([1, 2, 3])
+    with self.assertRaisesRegex(ValueError, "axes don't match array"):
+      np_array_ops.transpose(a_vector, [0, 1])
+    # Duplicate detection must not be bypassed by mixed int/Tensor axes.
+    a3 = np.arange(24).reshape(2, 3, 4)
+    with self.assertRaisesRegex(ValueError, 'repeated axis'):
+      np_array_ops.transpose(a3, [0, 0, constant_op.constant(2)])
+
+  def match_shape(self, actual, expected, msg=None):
+    if msg:
+      msg = 'Shape match failed for: {}. Expected: {} Actual: {}'.format(
+          msg, expected.shape, actual.shape)
+    self.assertEqual(actual.shape, expected.shape, msg=msg)
+
+  def match_dtype(self, actual, expected, msg=None):
+    if msg:
+      msg = 'Dtype match failed for: {}. Expected: {} Actual: {}.'.format(
+          msg, expected.dtype, actual.dtype
+      )
+    self.assertEqual(actual.dtype, expected.dtype, msg=msg)
+
+  def match(self, actual, expected, msg=None, check_dtype=True):
+    msg_ = 'Expected: {} Actual: {}'.format(expected, actual)
+    if msg:
+      msg = '{} {}'.format(msg_, msg)
+    else:
+      msg = msg_
+    self.assertIsInstance(actual, np_arrays.ndarray)
+    if check_dtype:
+      self.match_dtype(actual, expected, msg)
+    self.match_shape(actual, expected, msg)
+    if not actual.shape.rank:
+      self.assertAllClose(actual.tolist(), expected.tolist())
+    else:
+      self.assertAllClose(actual.tolist(), expected.tolist())
+
+  def testPad(self):
+    t = [[1, 2, 3], [4, 5, 6]]
+    paddings = [[
+        1,
+        1,
+    ], [2, 2]]
+    self.assertAllEqual(
+        np_array_ops.pad(t, paddings, 'constant'),
+        [[0, 0, 0, 0, 0, 0, 0], [0, 0, 1, 2, 3, 0, 0], [0, 0, 4, 5, 6, 0, 0],
+         [0, 0, 0, 0, 0, 0, 0]])
+
+    self.assertAllEqual(
+        np_array_ops.pad(t, paddings, 'reflect'),
+        [[6, 5, 4, 5, 6, 5, 4], [3, 2, 1, 2, 3, 2, 1], [6, 5, 4, 5, 6, 5, 4],
+         [3, 2, 1, 2, 3, 2, 1]])
+
+    self.assertAllEqual(
+        np_array_ops.pad(t, paddings, 'symmetric'),
+        [[2, 1, 1, 2, 3, 3, 2], [2, 1, 1, 2, 3, 3, 2], [5, 4, 4, 5, 6, 6, 5],
+         [5, 4, 4, 5, 6, 6, 5]])
+
+  def testTake(self):
+    a = [4, 3, 5, 7, 6, 8]
+    indices = [0, 1, 4]
+    self.assertAllEqual([4, 3, 6], np_array_ops.take(a, indices))
+    indices = [[0, 1], [2, 3]]
+    self.assertAllEqual([[4, 3], [5, 7]], np_array_ops.take(a, indices))
+    a = [[4, 3, 5], [7, 6, 8]]
+    self.assertAllEqual([[4, 3], [5, 7]], np_array_ops.take(a, indices))
+    a = np.random.rand(2, 16, 3)
+    axis = 1
+    self.assertAllEqual(
+        np.take(a, indices, axis=axis),
+        np_array_ops.take(a, indices, axis=axis))
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.take(a, indices, axis=3)
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.take(a, indices, axis=-4)
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.take([1, 2, 3], [0], axis=1)
+
+  def testTakeAlongAxis(self):
+    rng = np.random.default_rng()
+    x = rng.standard_normal((2, 3)).astype(np.float32)
+    ind = rng.integers(0, 3, (2, 5)).astype(np.int64)
+    out_expected = np.take_along_axis(x, ind, axis=1)
+    out = np_array_ops.take_along_axis(x, ind, axis=1)
+    self.assertAllEqual(out, out_expected)
+
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.take_along_axis(x, ind, axis=2)
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.take_along_axis(x, ind, axis=-3)
+
+  def testTakeAlongAxisJitCompile(self):
+    if test_util.is_xla_enabled():
+      self.skipTest("Not supported when compiled with XLA.")
+    # Regression test for GitHub issue 62391: the axis-swapping branch was
+    # emitted as a real conditional whose branches have different shapes, so
+    # the result shape XLA computed disagreed with the shape set on the
+    # result and a following op saw the wrong dimension.
+    x = constant_op.constant(
+        np.random.default_rng(1).standard_normal((5, 3, 2)), dtypes.float32
+    )
+    ind = constant_op.constant([[[-1]]], dtype=dtypes.int32)
+
+    def f(x, ind):
+      taken = np_array_ops.take_along_axis(x, ind, axis=-2)
+      return array_ops.squeeze(taken, axis=-2)
+
+    expected = f(x, ind)
+    self.assertAllEqual((5, 2), expected.shape)
+    actual = def_function.function(f, jit_compile=True)(x, ind)
+    self.assertAllEqual((5, 2), actual.shape)
+    self.assertAllClose(expected, actual)
+
+  def testTakeAlongAxisUnknownRank(self):
+    if test_util.is_xla_enabled():
+      self.skipTest("Not supported when compiled with XLA.")
+    # The tensor predicate is still used when the rank is not known
+    # statically.
+    @def_function.function(
+        input_signature=[
+            tensor_spec.TensorSpec(None, dtypes.float32),
+            tensor_spec.TensorSpec(None, dtypes.int32),
+        ]
+    )
+    def f(x, ind):
+      return np_array_ops.take_along_axis(x, ind, axis=1)
+
+    rng = np.random.default_rng(2)
+    x = rng.standard_normal((4, 6)).astype(np.float32)
+    ind = rng.integers(0, 6, (4, 3)).astype(np.int32)
+    self.assertAllClose(np.take_along_axis(x, ind, axis=1), f(x, ind))
+
+    # A valid negative axis still normalizes correctly when the rank is
+    # only known at runtime.
+
+    @def_function.function(
+        input_signature=[
+            tensor_spec.TensorSpec(None, dtypes.float32),
+            tensor_spec.TensorSpec(None, dtypes.int32),
+        ]
+    )
+    def g(x, ind):
+      return np_array_ops.take_along_axis(x, ind, axis=-1)
+
+    self.assertAllClose(np.take_along_axis(x, ind, axis=-1), g(x, ind))
+
+  def testWhere(self):
+    self.assertAllEqual([[1.0, 1.0], [1.0, 1.0]],
+                        np_array_ops.where([True], [1.0, 1.0],
+                                           [[0, 0], [0, 0]]))
+
+  def testShape(self):
+    self.assertAllEqual((1, 2), np_array_ops.shape([[0, 0]]))
+
+  def testSwapaxes(self):
+    x = [[1, 2, 3]]
+    self.assertAllEqual([[1], [2], [3]], np_array_ops.swapaxes(x, 0, 1))
+    self.assertAllEqual([[1], [2], [3]], np_array_ops.swapaxes(x, -2, -1))
+    x = [[[0, 1], [2, 3]], [[4, 5], [6, 7]]]
+    self.assertAllEqual([[[0, 4], [2, 6]], [[1, 5], [3, 7]]],
+                        np_array_ops.swapaxes(x, 0, 2))
+    self.assertAllEqual([[[0, 4], [2, 6]], [[1, 5], [3, 7]]],
+                        np_array_ops.swapaxes(x, -3, -1))
+
+  def testSwapaxesOutOfBoundsAxisRaises(self):
+    # Regression test for GitHub issue #122054: an axis far outside
+    # `[-rank, rank)` (e.g. -10 on a rank-5 array) used to be only
+    # partially normalized, producing a `perm` with leftover negative
+    # entries. That silently "succeeded" in eager (whose `Transpose`
+    # kernel re-normalizes negative perm entries) but crashed under
+    # `jit_compile=True` with an opaque tf2xla error, since the XLA
+    # bridge does not re-normalize. `swapaxes` should instead raise a
+    # clear, consistent error in both modes, matching `np.swapaxes`.
+    x = np.zeros((1, 4, 32, 32, 8), dtype=np.float32)
+    for axis1, axis2 in [(-10, -8), (-8, -10), (5, 0), (0, -6)]:
+      with self.assertRaisesRegex(ValueError, 'out of bounds'):
+        np_array_ops.swapaxes(x, axis1, axis2)
+
+  def testSwapaxesNegativeAxisWithJitCompile(self):
+    x = np.random.randn(2, 3, 4, 5, 6, 7).astype(np.float32)
+    expected = np.swapaxes(x, -3, 1)
+
+    @def_function.function(jit_compile=True)
+    def f(a):
+      return np_array_ops.swapaxes(a, -3, 1)
+
+    self.assertAllClose(expected, f(x))
+
+  def testSwapaxesOutOfBoundsDynamicRank(self):
+    # Regression test for #122054: when the rank is only known at
+    # runtime (traced with an unspecified input signature), a static
+    # out-of-bounds axis like -10 must still be rejected, not silently
+    # normalized into another negative (still out-of-bounds) value.
+    # This exercises the `control_flow_assert.Assert` added to the
+    # dynamic branch of `adjust_axes`. Note: this is deliberately *not*
+    # run with `jit_compile=True` — tf2xla lowers `Assert` to a no-op
+    # under XLA compilation, so a fully dynamic-rank bounds violation
+    # is not guaranteed to raise a clean error in that mode.
+    x = np.zeros((1, 4, 32, 32, 8), dtype=np.float32)
+
+    @def_function.function(
+        input_signature=[
+            tensor_spec.TensorSpec(dtype=dtypes.float32, shape=None)
+        ]
+    )
+    def f(a):
+      return np_array_ops.swapaxes(a, -10, 0)
+
+    with self.assertRaises(errors_impl.InvalidArgumentError):
+      self.evaluate(f(x))
+
+  def testMoveaxis(self):
+
+    def _test(*args):
+      # pylint: disable=no-value-for-parameter
+      expected = np.moveaxis(*args)
+      raw_ans = np_array_ops.moveaxis(*args)
+
+      self.assertAllEqual(expected, raw_ans)
+
+    a = np.random.rand(1, 2, 3, 4, 5, 6)
+
+    # Basic
+    _test(a, (0, 2), (3, 5))
+    _test(a, (0, 2), (-1, -3))
+    _test(a, (-6, -4), (3, 5))
+    _test(a, (-6, -4), (-1, -3))
+    _test(a, 0, 4)
+    _test(a, -6, -2)
+    _test(a, tuple(range(6)), tuple(range(6)))
+    _test(a, tuple(range(6)), tuple(reversed(range(6))))
+    _test(a, (), ())
+
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.moveaxis(a, -8, 0)
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.moveaxis(a, 0, 8)
+    with self.assertRaisesRegex(
+        ValueError, 'repeated axis in `source` argument'
+    ):
+      np_array_ops.moveaxis(a, (0, 0), (1, 2))
+    with self.assertRaisesRegex(
+        ValueError, 'repeated axis in `source` argument'
+    ):
+      np_array_ops.moveaxis(a, (0, -6), (1, 2))
+    with self.assertRaisesRegex(
+        ValueError, 'repeated axis in `destination` argument'
+    ):
+      np_array_ops.moveaxis(a, (0, 1), (2, 2))
+    with self.assertRaisesRegex(
+        ValueError, 'repeated axis in `destination` argument'
+    ):
+      np_array_ops.moveaxis(a, (0, 1), (2, -4))
+
+  def testFlip(self):
+    np.random.seed(0)
+    random_seed.set_seed(0)
+
+    def _test(*args, **kwargs):
+      expected = np.flip(*args, **kwargs)
+      raw_ans = np_array_ops.flip(*args, **kwargs)
+
+      self.assertAllEqual(expected, raw_ans)
+
+    a = np.random.rand(2, 3, 4)
+
+    # No axis reverses every dimension.
+    _test(a)
+    # A single axis, including negative values.
+    _test(a, axis=0)
+    _test(a, axis=2)
+    _test(a, axis=-1)
+    _test(a, axis=-3)
+    # 0-D and 1-D ndarray axes.
+    _test(a, axis=np.array(1))
+    _test(a, axis=np.array([0, 2]))
+    # A tuple, list or range of axes, including negative values.
+    _test(a, axis=(0, 1))
+    _test(a, axis=(-1, -3))
+    _test(a, axis=[0, 2])
+    _test(a, axis=(0, 1, 2))
+    _test(a, axis=range(3))
+    # Out-of-bounds axes raise InvalidArgumentError from the C++ kernel.
+    kernel_err = (
+        r'(out of (valid )?range'
+        r'|can not have more elements than input tensor has dimensions)'
+    )
+    with self.assertRaisesRegex(errors_impl.InvalidArgumentError, kernel_err):
+      self.evaluate(np_array_ops.flip(np.float64(1.0), axis=0))
+    with self.assertRaisesRegex(errors_impl.InvalidArgumentError, kernel_err):
+      self.evaluate(np_array_ops.flip(a, axis=3))
+    with self.assertRaisesRegex(errors_impl.InvalidArgumentError, kernel_err):
+      self.evaluate(np_array_ops.flip(a, axis=-4))
+    with self.assertRaisesRegex(errors_impl.InvalidArgumentError, kernel_err):
+      self.evaluate(np_array_ops.flip(a, axis=(0, 3)))
+    with self.assertRaisesRegex(errors_impl.InvalidArgumentError, kernel_err):
+      self.evaluate(np_array_ops.flip(a, axis=[0, -4]))
+    with self.assertRaisesRegex(errors_impl.InvalidArgumentError, kernel_err):
+      self.evaluate(np_array_ops.flip(a, axis=np.array(3)))
+    with self.assertRaisesRegex(errors_impl.InvalidArgumentError, kernel_err):
+      self.evaluate(np_array_ops.flip(a, axis=np.array([3])))
+    with self.assertRaisesRegex(errors_impl.InvalidArgumentError, kernel_err):
+      self.evaluate(np_array_ops.flip(a, axis=range(4)))
+    with self.assertRaisesRegex(errors_impl.InvalidArgumentError, kernel_err):
+      self.evaluate(np_array_ops.fliplr(np.arange(3)))
+    # The C++ kernel raises at execution time (or shape inference at trace time).
+    with self.assertRaisesRegex(
+        (errors_impl.InvalidArgumentError, ValueError), kernel_err
+    ):
+      self.evaluate(
+          def_function.function(lambda x: np_array_ops.flip(x, axis=-4))(a)
+      )
+    # Unknown-rank inputs keep the previous behavior for valid axes.
+    flip_unknown_rank = def_function.function(
+        lambda x: np_array_ops.flip(x, axis=-1),
+        input_signature=[tensor_spec.TensorSpec(None, dtypes.float64)],
+    )
+    self.assertAllEqual(np.flip(a, -1), flip_unknown_rank(a))
+
+    # Unknown-rank inputs raise InvalidArgumentError for out-of-bounds axes,
+    # both negative and positive.
+    flip_unknown_rank_invalid_neg = def_function.function(
+        lambda x: np_array_ops.flip(x, axis=-4),
+        input_signature=[tensor_spec.TensorSpec(None, dtypes.float64)],
+    )
+    with self.assertRaisesRegex(errors_impl.InvalidArgumentError, kernel_err):
+      self.evaluate(flip_unknown_rank_invalid_neg(a))
+
+    flip_unknown_rank_invalid_pos = def_function.function(
+        lambda x: np_array_ops.flip(x, axis=3),
+        input_signature=[tensor_spec.TensorSpec(None, dtypes.float64)],
+    )
+    with self.assertRaisesRegex(errors_impl.InvalidArgumentError, kernel_err):
+      self.evaluate(flip_unknown_rank_invalid_pos(a))
+
+  def testRoll(self):
+    np.random.seed(0)
+    random_seed.set_seed(0)
+
+    def _test(*args, **kwargs):
+      expected = np.roll(*args, **kwargs)
+      raw_ans = np_array_ops.roll(*args, **kwargs)
+
+      self.assertAllEqual(expected, raw_ans)
+
+    a = np.random.rand(2, 3, 4)
+
+    # No axis rolls the flattened array.
+    _test(a, 1)
+    # A scalar shift on a single axis, including negative values.
+    _test(a, 1, axis=0)
+    _test(a, -1, axis=2)
+    _test(a, 2, axis=-1)
+    # A sequence of shifts across multiple axes.
+    _test(a, (1, 2, 3), axis=(0, 1, 2))
+    _test(a, [1, -2], axis=[-3, 2])
+    _test(a, np.array([0, 1]), axis=np.array([-1, 1]))
+
+    # Empty and scalar arrays, including rolls on the empty dimension itself
+    # (exercising the max(dim_size, 1) safeguard).
+    _test(np.empty((0, 3, 4)), 1, axis=0)
+    _test(np.empty((0, 3, 4)), 1, axis=1)
+    _test(np.empty((3, 4, 0)), 1, axis=1)
+    _test(np.empty((3, 4, 0)), 1, axis=2)
+    _test(np.array(42.0), 1)
+
+    # Out-of-bounds axes raise, checked by the backend kernel.
+    for shift, invalid_axis in [
+        (1, 3),
+        (1, -4),
+        ((1, 2), (0, 3)),
+        ((1, -1), [0, -4]),
+        (range(2), range(2, 4)),
+        (1, 1 << 33),
+        (1, -(1 << 33)),
+    ]:
+      with self.assertRaisesRegex(
+          (errors_impl.InvalidArgumentError, ValueError), 'out of range'
+      ):
+        np_array_ops.roll(a, shift, axis=invalid_axis)
+
+    # Graph-mode tracing of roll with concrete axes.
+    @def_function.function
+    def f(x, s, ax):
+      return np_array_ops.roll(x, s, axis=ax)
+
+    self.assertAllEqual(
+        np.roll(a, 1, axis=0),
+        f(a, 1, 0),
+    )
+    self.assertAllEqual(
+        np.roll(a, 1, axis=0),
+        f(a, constant_op.constant(1), constant_op.constant(0)),
+    )
+    with self.assertRaisesRegex(
+        (errors_impl.InvalidArgumentError, ValueError), 'out of range'
+    ):
+      f(a, 1, 3)
+    with self.assertRaisesRegex(
+        (errors_impl.InvalidArgumentError, ValueError), 'out of range'
+    ):
+      f(a, constant_op.constant(1), constant_op.constant(3))
+
+  def testNdim(self):
+    self.assertAllEqual(0, np_array_ops.ndim(0.5))
+    self.assertAllEqual(1, np_array_ops.ndim([1, 2]))
+
+  def testIsscalar(self):
+    self.assertTrue(np_array_ops.isscalar(0.5))
+    self.assertTrue(np_array_ops.isscalar(5))
+    self.assertTrue(np_array_ops.isscalar(False))
+    self.assertFalse(np_array_ops.isscalar([1, 2]))
+
+  def assertListEqual(self, a, b):
+    self.assertAllEqual(len(a), len(b))
+    for x, y in zip(a, b):
+      self.assertAllEqual(x, y)
+
+  def testSplit(self):
+    x = np_array_ops.arange(9)
+    y = np_array_ops.split(x, 3)
+    self.assertListEqual([([0, 1, 2]), ([3, 4, 5]), ([6, 7, 8])], y)
+
+    x = np_array_ops.arange(8)
+    y = np_array_ops.split(x, [3, 5, 6, 10])
+    self.assertListEqual([([0, 1, 2]), ([3, 4]), ([5]), ([6, 7]), ([])], y)
+
+  def testSplitNegativeBoundaries(self):
+    x = np.arange(9)
+    for boundaries in (
+        [2, -2],
+        [-6, -2],
+        [-15],
+        [-15, -10, 3],
+        [-9, 0, -1],
+    ):
+      self.assertListEqual(
+          np.split(x, boundaries),
+          np_array_ops.split(x, boundaries),
+      )
+
+    x_2d = np.arange(12).reshape(2, 6)
+    for axis in (1, -1):
+      self.assertListEqual(
+          np.split(x_2d, [1, -1], axis=axis),
+          np_array_ops.split(x_2d, [1, -1], axis=axis),
+      )
+
+    x_empty = np.zeros((0, 4), dtype=np.int32)
+    self.assertListEqual(
+        np.split(x_empty, [-2, 0, 2], axis=0),
+        np_array_ops.split(x_empty, [-2, 0, 2], axis=0),
+    )
+
+    for bad_boundaries in ([7, -5], [-2, -5]):
+      with self.assertRaisesRegex(
+          ValueError, 'smaller than the previous boundary'
+      ):
+        np_array_ops.split(x, bad_boundaries)
+
+    for dyn_boundaries in ([-2], [2, -2], [2, 4]):
+
+      @def_function.function(
+          input_signature=[tensor_spec.TensorSpec([None], dtypes.int32)]
+      )
+      def split_dynamic(arr, b=dyn_boundaries):
+        return np_array_ops.split(arr, b)
+
+      with self.assertRaisesRegex(
+          ValueError, 'Split boundaries are not supported for dynamic shapes.'
+      ):
+        split_dynamic(np_array_ops.arange(9, dtype=np.int32))
+
+    @def_function.function(
+        input_signature=[tensor_spec.TensorSpec(None, dtypes.int32)]
+    )
+    def split_unknown_rank(arr):
+      return np_array_ops.split(arr, [-2])
+
+    with self.assertRaisesRegex(
+        ValueError, 'Split boundaries are not supported for unknown rank.'
+    ):
+      split_unknown_rank(np_array_ops.arange(9, dtype=np.int32))
+
+  def testSplitOutOfBoundsAxis(self):
+    x_2d = np_array_ops.arange(6).reshape(2, 3)
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.split(x_2d, 2, axis=-3)
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.split(x_2d, 2, axis=2)
+    # Test list sections (caught by the new early static rank bounds
+    # check in split, before _boundaries_to_sizes is reached)
+    with self.assertRaisesRegex(ValueError, 'out of bound'):
+      np_array_ops.split(x_2d, [1], axis=-3)
+
+    x_1d = np_array_ops.arange(3)
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.split(x_1d, 1, axis=-2)
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.split(x_1d, 1, axis=1)
+
+    x_0d = np_array_ops.array(5)
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.split(x_0d, 1, axis=-1)
+    with self.assertRaisesRegex(ValueError, 'out of bounds'):
+      np_array_ops.split(x_0d, 1, axis=0)
+
+  def testHSplitBecomesVsplitFor1DInput(self):
+    @def_function.function
+    def f(arr):
+      return np_array_ops.hsplit(arr, 2)
+
+    x = np_array_ops.arange(4)
+    self.assertListEqual([[0, 1], [2, 3]], f(x))
+
+  def testSign(self):
+    state = np.random.RandomState(0)
+    test_types = [np.float16, np.float32, np.float64, np.int32, np.int64,
+                  np.complex64, np.complex128]
+    test_shapes = [(), (1,), (2, 3, 4), (2, 3, 0, 4)]
+
+    for dtype in test_types:
+      for shape in test_shapes:
+        if np.issubdtype(dtype, np.complexfloating):
+          arr = (np.asarray(state.randn(*shape) * 100, dtype=dtype) +
+                 1j * np.asarray(state.randn(*shape) * 100, dtype=dtype))
+        else:
+          arr = np.asarray(state.randn(*shape) * 100, dtype=dtype)
+        self.match(np_array_ops.sign(arr), np.sign(arr))
+
+    with self.assertRaisesRegex(ValueError, "doesn't support setting out"):
+      np_array_ops.sign([1], out=[])
+    with self.assertRaisesRegex(ValueError, "doesn't support setting where"):
+      np_array_ops.sign([1], where=False)
+
+
+class ArrayManipulationTest(test.TestCase):
+
+  def setUp(self):
+    super(ArrayManipulationTest, self).setUp()
+    self.array_transforms = [
+        lambda x: x,
+        ops.convert_to_tensor,
+        np.array,
+        np_array_ops.array,
+    ]
+
+  def testBroadcastTo(self):
+
+    def run_test(arr, shape):
+      for fn in self.array_transforms:
+        arg1 = fn(arr)
+        self.match(
+            np_array_ops.broadcast_to(arg1, shape),
+            np.broadcast_to(arg1, shape))
+
+    run_test(1, 2)
+    run_test(1, (2, 2))
+    run_test([1, 2], (2, 2))
+    run_test([[1], [2]], (2, 2))
+    run_test([[1, 2]], (3, 2))
+    run_test([[[1, 2]], [[3, 4]], [[5, 6]]], (3, 4, 2))
+
+  def testIx_(self):
+    possible_arys = [[True, True], [True, False], [False, False],
+                     list(range(5)), np_array_ops.empty(0, dtype=np.int64)]
+    for r in range(len(possible_arys)):
+      for arys in itertools.combinations_with_replacement(possible_arys, r):
+        tnp_ans = np_array_ops.ix_(*arys)
+        onp_ans = np.ix_(*arys)
+        for t, o in zip(tnp_ans, onp_ans):
+          self.match(t, o)
+
+  def match_shape(self, actual, expected, msg=None):
+    if msg:
+      msg = 'Shape match failed for: {}. Expected: {} Actual: {}'.format(
+          msg, expected.shape, actual.shape)
+    self.assertEqual(actual.shape, expected.shape, msg=msg)
+
+  def match_dtype(self, actual, expected, msg=None):
+    if msg:
+      msg = 'Dtype match failed for: {}. Expected: {} Actual: {}.'.format(
+          msg, expected.dtype, actual.dtype
+      )
+    self.assertEqual(actual.dtype, expected.dtype, msg=msg)
+
+  def match(self, actual, expected, msg=None):
+    msg_ = 'Expected: {} Actual: {}'.format(expected, actual)
+    if msg:
+      msg = '{} {}'.format(msg_, msg)
+    else:
+      msg = msg_
+    self.assertIsInstance(actual, np_arrays.ndarray)
+    self.match_dtype(actual, expected, msg)
+    self.match_shape(actual, expected, msg)
+    if not actual.shape.rank:
+      self.assertEqual(actual.tolist(), expected.tolist())
+    else:
+      self.assertSequenceEqual(actual.tolist(), expected.tolist())
+
+
+class ArrayMathTest(test.TestCase, parameterized.TestCase):
+
+  @parameterized.named_parameters(
+      ('complex_mul_1', 2j, [2], int, [4j], operator.mul),
+      ('complex_mul_2', 2j, [0], int, [0], operator.mul),
+      ('complex_mul_3', 2j, [-2.0], float, [-4j], operator.mul),
+      ('complex_mul_4', 2j, [2j], complex, [-4], operator.mul),
+      ('float_mul_1', 2.0, [2], int, [4], operator.mul),
+      ('float_mul_2', 2.0, [0], int, [0], operator.mul),
+      ('float_mul_3', 2.0, [-2.0], float, [-4], operator.mul),
+      ('float_mul_4', 2.0, [2j], complex, [4j], operator.mul))
+  def testConstantBinOp(self, a, b, b_type, expected_result, test_func):
+    b = np_array_ops.array(b, dtype=b_type)
+    result = test_func(a, b)
+    if np.issubdtype(result.dtype.as_numpy_dtype, np.inexact):
+      self.assertAllClose(result, expected_result)
+    else:
+      self.assertAllEqual(result, expected_result)
+
+
+class StringArrayTest(test.TestCase, parameterized.TestCase):
+
+  StringParameters = parameterized.named_parameters(  # pylint: disable=invalid-name
+      # Tensorflow always encodes python string into bytes, regardless of
+      # requested dtype.
+      ('str_u8', 'abcde\U0001f005', 'U8', b'abcde\xf0\x9f\x80\x85'),
+      ('str_s8', 'abcde\U0001f005', 'S8', b'abcde\xf0\x9f\x80\x85'),
+      ('str_none', 'abcde\U0001f005', None, b'abcde\xf0\x9f\x80\x85'),
+      ('zstr_u8', '\0abcde\U0001f005', 'U8', b'\0abcde\xf0\x9f\x80\x85'),
+      ('zstr_s8', '\0abcde\U0001f005', 'S8', b'\0abcde\xf0\x9f\x80\x85'),
+      ('zstr_none', '\0abcde\U0001f005', None, b'\0abcde\xf0\x9f\x80\x85'),
+      ('bytes_u8', b'abcdef', 'U8', b'abcdef'),
+      ('bytes_s8', b'abcdef', 'S8', b'abcdef'),
+      ('bytes_none', b'abcdef', None, b'abcdef'),
+      ('zbytes_u8', b'\0abcdef', 'U8', b'\0abcdef'),
+      ('zbytes_s8', b'\0abcdef', 'S8', b'\0abcdef'),
+      ('zbytes_none', b'\0abcdef', None, b'\0abcdef'),
+  )
+
+  @StringParameters
+  def testArray(self, a, dtype, a_as_bytes):
+    b = np_array_ops.array(a, dtype=dtype)
+    self.assertIsInstance(b.numpy(), bytes)
+    self.assertEqual(b.numpy(), a_as_bytes)
+
+  @StringParameters
+  def testAsArray(self, a, dtype, a_as_bytes):
+    b = np_array_ops.asarray(a, dtype=dtype)
+    self.assertIsInstance(b.numpy(), bytes)
+    self.assertEqual(b.numpy(), a_as_bytes)
+
+  @StringParameters
+  def testZerosLike(self, a, dtype, unused_a_as_bytes):
+    b = np_array_ops.zeros_like(a, dtype=dtype)
+    self.assertIsInstance(b.numpy(), bytes)
+    self.assertEqual(b.numpy(), b'')
+
+  @StringParameters
+  def testEmptyLike(self, a, dtype, unused_a_as_bytes):
+    b = np_array_ops.empty_like(a, dtype=dtype)
+    self.assertIsInstance(b.numpy(), bytes)
+    self.assertEqual(b.numpy(), b'')
+
+
+if __name__ == '__main__':
+  ops.enable_eager_execution()
+  ops.set_dtype_conversion_mode('legacy')
+  np_math_ops.enable_numpy_methods_on_tensor()
+  test.main()

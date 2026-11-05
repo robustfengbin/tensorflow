@@ -1,0 +1,111 @@
+/* Copyright 2016 The TensorFlow Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+
+#define EIGEN_USE_GPU
+
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "tensorflow/core/framework/register_types.h"
+#include "tensorflow/core/framework/tensor_types.h"
+#include "tensorflow/core/kernels/roll_op.h"
+#include "tensorflow/core/platform/types.h"
+#include "tensorflow/core/util/gpu_kernel_helper.h"
+
+namespace tensorflow {
+
+typedef Eigen::GpuDevice GPUDevice;
+
+namespace {
+
+template <typename T>
+__global__ void RollKernel(const int64_t nthreads, const int32_t num_dims,
+                           const T* __restrict__ input, T* __restrict__ output,
+                           const int64_t* __restrict__ dim_size,
+                           const int64_t* __restrict__ threshold,
+                           const int64_t* __restrict__ dim_range) {
+  CUDA_1D_KERNEL_LOOP(out_idx, nthreads, int64_t) {
+    int64_t offset = 0;
+    for (int i = 0; i < num_dims; i++) {
+      const int64_t stride = i + 1 < num_dims ? dim_range[i + 1] : 1;
+      const int64_t shift = dim_size[i] - threshold[i];
+      const int64_t indx = (out_idx / stride) % dim_size[i];
+      const int64_t shifted_indx = (indx + shift) % dim_size[i];
+      offset += (shifted_indx - indx) * stride;
+    }
+    output[out_idx + offset] = input[out_idx];
+  }
+}
+}  // namespace
+
+namespace functor {
+
+template <typename T>
+struct Roll<GPUDevice, T> {
+  void operator()(OpKernelContext* context, const int64_t num_elements,
+                  const int num_dims, const absl::Span<const int64_t> dim_size,
+                  const T* input, T* output,
+                  const absl::Span<const int64_t> threshold,
+                  const absl::Span<const int64_t> dim_range,
+                  const int64_t isd) {
+    if (!num_elements) return;
+    const GPUDevice& d = context->eigen_device<GPUDevice>();
+
+    auto config_or = GetGpuLaunchConfig64(num_elements, d);
+    OP_REQUIRES_OK(context, config_or.status());
+    const GpuLaunchConfig64& cfg = *config_or;
+
+    auto dim_bytes = sizeof(int64_t) * dim_size.size();
+    auto dim_buf = d.allocate(dim_bytes);
+
+    auto thres_bytes = sizeof(int64_t) * threshold.size();
+    auto thres_buf = d.allocate(thres_bytes);
+
+    auto range_bytes = sizeof(int64_t) * dim_range.size();
+    auto range_buf = d.allocate(range_bytes);
+
+    d.memcpyHostToDevice(dim_buf, dim_size.data(), dim_bytes);
+    d.memcpyHostToDevice(thres_buf, threshold.data(), thres_bytes);
+    d.memcpyHostToDevice(range_buf, dim_range.data(), range_bytes);
+
+    absl::Status launch_status =
+        GpuLaunchKernel(RollKernel<T>, cfg.block_count, cfg.thread_per_block, 0,
+                        d.stream(), cfg.virtual_thread_count, num_dims, input,
+                        output, reinterpret_cast<const int64_t*>(dim_buf),
+                        reinterpret_cast<const int64_t*>(thres_buf),
+                        reinterpret_cast<const int64_t*>(range_buf));
+
+    d.deallocate(dim_buf);
+    d.deallocate(thres_buf);
+    d.deallocate(range_buf);
+
+    OP_REQUIRES_OK(context, launch_status);
+  }
+};
+
+#define DEFINE_GPU_SPECS(T) template struct Roll<GPUDevice, T>;
+
+TF_CALL_int32(DEFINE_GPU_SPECS);
+TF_CALL_int64(DEFINE_GPU_SPECS);
+TF_CALL_uint32(DEFINE_GPU_SPECS);
+TF_CALL_GPU_NUMBER_TYPES(DEFINE_GPU_SPECS);
+TF_CALL_COMPLEX_TYPES(DEFINE_GPU_SPECS);
+
+#undef DEFINE_GPU_SPECS
+}  // namespace functor
+}  // namespace tensorflow
+
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM

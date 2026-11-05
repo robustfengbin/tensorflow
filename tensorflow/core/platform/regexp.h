@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,25 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef TENSORFLOW_PLATFORM_REGEXP_H_
-#define TENSORFLOW_PLATFORM_REGEXP_H_
+#ifndef TENSORFLOW_CORE_PLATFORM_REGEXP_H_
+#define TENSORFLOW_CORE_PLATFORM_REGEXP_H_
+#include "tsl/platform/regexp.h"
 
-#include "tensorflow/core/platform/platform.h"
-#include "tensorflow/core/platform/types.h"
-
-#if defined(PLATFORM_GOOGLE) || defined(PLATFORM_GOOGLE_ANDROID)
-#include "tensorflow/core/platform/google/build_config/re2.h"
-namespace tensorflow {
-typedef ::StringPiece RegexpStringPiece;
-}  // namespace tensorflow
-
-#else
-
-#include "re2/re2.h"
-namespace tensorflow {
-typedef re2::StringPiece RegexpStringPiece;
-}  // namespace tensorflow
-
-#endif
-
-#endif  // TENSORFLOW_PLATFORM_REGEXP_H_
+#endif  // TENSORFLOW_CORE_PLATFORM_REGEXP_H_

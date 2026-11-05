@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,32 +14,41 @@ limitations under the License.
 ==============================================================================*/
 
 #include "tensorflow/core/platform/env.h"
+#include "tensorflow/core/platform/null_file_system.h"
 
 namespace tensorflow {
 
 class TestRandomAccessFile : public RandomAccessFile {
-  // The filecontents is all A's
-  Status Read(uint64 offset, size_t n, StringPiece* result,
-              char* scratch) const override {
+  // The file contents is 10 bytes of all A's
+  absl::Status Read(uint64_t offset, size_t n, absl::string_view* result,
+                    char* scratch) const override {
+    absl::Status s;
     for (int i = 0; i < n; ++i) {
+      if (offset + i >= 10) {
+        n = i;
+        s = absl::OutOfRangeError("EOF");
+        break;
+      }
       scratch[i] = 'A';
     }
-    *result = StringPiece(scratch, n);
-    return Status::OK();
+    *result = absl::string_view(scratch, n);
+    return s;
   }
 };
 
 class TestFileSystem : public NullFileSystem {
  public:
-  Status NewRandomAccessFile(const string& fname,
-                             RandomAccessFile** result) override {
-    *result = new TestRandomAccessFile;
-    return Status::OK();
+  absl::Status NewRandomAccessFile(
+      const std::string& fname,
+      std::unique_ptr<RandomAccessFile>* result) override {
+    result->reset(new TestRandomAccessFile);
+    return absl::OkStatus();
   }
   // Always return size of 10
-  Status GetFileSize(const string& fname, uint64* file_size) override {
+  absl::Status GetFileSize(const std::string& fname,
+                           uint64_t* file_size) override {
     *file_size = 10;
-    return Status::OK();
+    return absl::OkStatus();
   }
 };
 

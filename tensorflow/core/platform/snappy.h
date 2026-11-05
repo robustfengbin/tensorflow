@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,22 +13,28 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef TENSORFLOW_PLATFORM_SNAPPY_H_
-#define TENSORFLOW_PLATFORM_SNAPPY_H_
+#ifndef TENSORFLOW_CORE_PLATFORM_SNAPPY_H_
+#define TENSORFLOW_CORE_PLATFORM_SNAPPY_H_
 
 #include "tensorflow/core/platform/types.h"
+#include "tsl/platform/snappy.h"
+
+#if !defined(PLATFORM_WINDOWS)
+#include <sys/uio.h>
+#else
+namespace tensorflow {
+using tsl::iovec;
+}  // namespace tensorflow
+#endif
 
 namespace tensorflow {
 namespace port {
-
-// Snappy compression/decompression support
-bool Snappy_Compress(const char* input, size_t length, string* output);
-
-bool Snappy_GetUncompressedLength(const char* input, size_t length,
-                                  size_t* result);
-bool Snappy_Uncompress(const char* input, size_t length, char* output);
-
+using tsl::port::Snappy_Compress;
+using tsl::port::Snappy_CompressFromIOVec;
+using tsl::port::Snappy_GetUncompressedLength;
+using tsl::port::Snappy_Uncompress;
+using tsl::port::Snappy_UncompressToIOVec;
 }  // namespace port
 }  // namespace tensorflow
 
-#endif  // TENSORFLOW_PLATFORM_SNAPPY_H_
+#endif  // TENSORFLOW_CORE_PLATFORM_SNAPPY_H_

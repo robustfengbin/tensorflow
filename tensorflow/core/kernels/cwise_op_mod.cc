@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,9 +13,47 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <cstdint>
+
 #include "tensorflow/core/kernels/cwise_ops_common.h"
 
 namespace tensorflow {
-REGISTER2(BinaryOp, CPU, "Mod", functor::mod, int32, int64);
+REGISTER2(BinaryOp, CPU, "Mod", functor::safe_mod, int32_t, int64_t);
 REGISTER2(BinaryOp, CPU, "Mod", functor::fmod, float, double);
+REGISTER2(BinaryOp, CPU, "TruncateMod", functor::safe_mod, int32_t, int64_t);
+REGISTER2(BinaryOp, CPU, "TruncateMod", functor::fmod, float, double);
+
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+// A special GPU kernel for int32.
+// TODO(b/25387198): Also enable int32 in device memory. This kernel
+// registration requires all int32 inputs and outputs to be in host memory.
+REGISTER_KERNEL_BUILDER(Name("Mod")
+                            .Device(DEVICE_GPU)
+                            .HostMemory("x")
+                            .HostMemory("y")
+                            .HostMemory("z")
+                            .TypeConstraint<int32_t>("T"),
+                        BinaryOp<CPUDevice, functor::safe_mod<int32_t>>);
+REGISTER_KERNEL_BUILDER(Name("TruncateMod")
+                            .Device(DEVICE_GPU)
+                            .HostMemory("x")
+                            .HostMemory("y")
+                            .HostMemory("z")
+                            .TypeConstraint<int32_t>("T"),
+                        BinaryOp<CPUDevice, functor::safe_mod<int32_t>>);
+#endif
+REGISTER_KERNEL_BUILDER(Name("Mod")
+                            .Device(DEVICE_DEFAULT)
+                            .HostMemory("x")
+                            .HostMemory("y")
+                            .HostMemory("z")
+                            .TypeConstraint<int32_t>("T"),
+                        BinaryOp<CPUDevice, functor::safe_mod<int32_t>>);
+REGISTER_KERNEL_BUILDER(Name("TruncateMod")
+                            .Device(DEVICE_DEFAULT)
+                            .HostMemory("x")
+                            .HostMemory("y")
+                            .HostMemory("z")
+                            .TypeConstraint<int32_t>("T"),
+                        BinaryOp<CPUDevice, functor::safe_mod<int32_t>>);
 }  // namespace tensorflow

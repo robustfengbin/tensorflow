@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -31,8 +31,8 @@ namespace {
 TEST(TensorShapeUtilTest, TensorNameSliceToOrderedCode) {
   {
     TensorSlice s = TensorSlice::ParseOrDie("-:-:1,3:4,5");
-    string buffer = EncodeTensorNameSlice("foo", s);
-    string name;
+    std::string buffer = EncodeTensorNameSlice("foo", s);
+    std::string name;
     s.Clear();
     TF_CHECK_OK(DecodeTensorNameSlice(buffer, &name, &s));
     EXPECT_EQ("foo", name);

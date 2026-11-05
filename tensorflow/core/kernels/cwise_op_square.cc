@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,10 +16,19 @@ limitations under the License.
 #include "tensorflow/core/kernels/cwise_ops_common.h"
 
 namespace tensorflow {
-REGISTER5(UnaryOp, CPU, "Square", functor::square, float, double, int32,
-          complex64, int64);
-#if GOOGLE_CUDA
-REGISTER3(UnaryOp, GPU, "Square", functor::square, float, double, int64);
+
+REGISTER7(UnaryOp, CPU, "Square", functor::square, float, Eigen::half, double,
+          int32_t, int64_t, complex64, complex128);
+REGISTER7(UnaryOp, CPU, "Square", functor::square, bfloat16, int8_t, int16_t,
+          uint8_t, uint16_t, uint32_t, uint64_t);
+
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+#if !defined(MLIR_GENERATED_GPU_KERNELS_ENABLED)
+REGISTER4(UnaryOp, GPU, "Square", functor::square, float, Eigen::half, double,
+          int64);
+#endif
+
+REGISTER(UnaryOp, GPU, "Square", functor::square, bfloat16);
 
 // A special GPU kernel for int32.
 // TODO(b/25387198): Also enable int32 in device memory. This kernel
@@ -28,7 +37,15 @@ REGISTER_KERNEL_BUILDER(Name("Square")
                             .Device(DEVICE_GPU)
                             .HostMemory("x")
                             .HostMemory("y")
-                            .TypeConstraint<int32>("T"),
-                        UnaryOp<CPUDevice, functor::square<int32>>);
+                            .TypeConstraint<int32_t>("T"),
+                        UnaryOp<CPUDevice, functor::square<int32_t>>);
 #endif
+
+REGISTER_KERNEL_BUILDER(Name("Square")
+                            .Device(DEVICE_DEFAULT)
+                            .HostMemory("x")
+                            .HostMemory("y")
+                            .TypeConstraint<int32_t>("T"),
+                        UnaryOp<CPUDevice, functor::square<int32_t>>);
+
 }  // namespace tensorflow

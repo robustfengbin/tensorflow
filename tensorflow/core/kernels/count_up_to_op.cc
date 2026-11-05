@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,7 +14,11 @@ limitations under the License.
 ==============================================================================*/
 
 #include "tensorflow/core/framework/op_kernel.h"
+#include "tensorflow/core/framework/resource_handle.h"
+#include "tensorflow/core/framework/resource_mgr.h"
+#include "tensorflow/core/kernels/variable_ops.h"
 #include "tensorflow/core/lib/core/errors.h"
+#include "tensorflow/core/lib/core/refcount.h"
 #include "tensorflow/core/platform/mutex.h"
 #include "tensorflow/core/platform/types.h"
 
@@ -32,9 +36,10 @@ class CountUpToOp : public OpKernel {
     {
       mutex_lock l(*context->input_ref_mutex(0));
       Tensor tensor = context->mutable_input(0, true);
-      OP_REQUIRES(context, TensorShapeUtils::IsScalar(tensor.shape()),
-                  errors::InvalidArgument("input is not a scalar: ",
-                                          tensor.shape().DebugString()));
+      OP_REQUIRES(
+          context, TensorShapeUtils::IsScalar(tensor.shape()),
+          absl::InvalidArgumentError(absl::StrCat(
+              "input is not a scalar: ", tensor.shape().DebugString())));
       T* ptr = &tensor.scalar<T>()();
       before_increment = *ptr;
       if (*ptr >= limit_) {
@@ -54,13 +59,55 @@ class CountUpToOp : public OpKernel {
   T limit_;
 };
 
-#define REGISTER(TYPE)                                                \
-  REGISTER_KERNEL_BUILDER(                                            \
-      Name("CountUpTo").TypeConstraint<TYPE>("T").Device(DEVICE_CPU), \
-      CountUpToOp<TYPE>)
+template <class T>
+class ResourceCountUpToOp : public OpKernel {
+ public:
+  explicit ResourceCountUpToOp(OpKernelConstruction* context)
+      : OpKernel(context) {
+    OP_REQUIRES_OK(context, context->GetAttr("limit", &limit_));
+    OP_REQUIRES_OK(context, context->GetAttr("T", &dtype_));
+  }
 
-REGISTER(int32);
-REGISTER(int64);
+  void Compute(OpKernelContext* context) override {
+    core::RefCountPtr<Var> variable;
+    ResourceHandle handle;
+    OP_REQUIRES_OK(context, HandleFromInput(context, 0, &handle));
+    OP_REQUIRES_OK(context, LookupResource(context, handle, &variable));
+    mutex_lock l(*variable->mu());
+    Tensor before_increment = *variable->tensor();
+    OP_REQUIRES(context, TensorShapeUtils::IsScalar(before_increment.shape()),
+                absl::InvalidArgumentError(
+                    absl::StrCat("input is not a scalar: ",
+                                 before_increment.shape().DebugString())));
+    if (before_increment.scalar<T>()() >= limit_) {
+      context->SetStatus(errors::OutOfRange("Reached limit of ", limit_));
+      return;
+    }
+    // Allocate new buffer
+    AllocatorAttributes attr;
+    attr.set_gpu_compatible(true);
+    attr.set_nic_compatible(true);
+    OP_REQUIRES_OK(context, context->allocate_temp(dtype_, TensorShape({}),
+                                                   variable->tensor(), attr));
+    variable->tensor()->scalar<T>()() = before_increment.scalar<T>()() + 1;
+    context->set_output(0, before_increment);
+  }
+
+ private:
+  T limit_;
+  DataType dtype_;
+};
+
+#define REGISTER(TYPE)                                                        \
+  REGISTER_KERNEL_BUILDER(                                                    \
+      Name("CountUpTo").TypeConstraint<TYPE>("T").Device(DEVICE_CPU),         \
+      CountUpToOp<TYPE>)                                                      \
+  REGISTER_KERNEL_BUILDER(                                                    \
+      Name("ResourceCountUpTo").TypeConstraint<TYPE>("T").Device(DEVICE_CPU), \
+      ResourceCountUpToOp<TYPE>)
+
+REGISTER(int32_t);
+REGISTER(int64_t);
 
 #undef REGISTER
 

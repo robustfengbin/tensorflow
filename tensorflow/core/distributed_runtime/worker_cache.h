@@ -1,4 +1,4 @@
-/* Copyright 2016 Google Inc. All Rights Reserved.
+/* Copyright 2016 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,47 +19,69 @@ limitations under the License.
 #include <string>
 #include <vector>
 
-#include "tensorflow/core/distributed_runtime/worker_interface.h"  // for CallOptions
-#include "tensorflow/core/framework/device_attributes.pb.h"  // for BusAdjacency
+#include "tensorflow/core/distributed_runtime/coordination/coordination_client.h"
+#include "tensorflow/core/distributed_runtime/eager/eager_client.h"
+#include "tensorflow/core/distributed_runtime/worker_interface.h"
+#include "tensorflow/core/framework/device_attributes.pb.h"  // for DeviceLocality
 #include "tensorflow/core/lib/core/status.h"
 
 namespace tensorflow {
-typedef std::function<void(const Status&)> StatusCallback;
+typedef std::function<void(const absl::Status&)> StatusCallback;
 
 class ChannelCache;
 class StepStats;
-class WorkerInterface;
 
 class WorkerCacheInterface {
  public:
-  virtual ~WorkerCacheInterface() {}
+  virtual ~WorkerCacheInterface() = default;
 
   // Updates *workers with strings naming the remote worker tasks to
   // which open channels have been established.
-  virtual void ListWorkers(std::vector<string>* workers) = 0;
+  virtual void ListWorkers(std::vector<std::string>* workers) const = 0;
+  virtual void ListWorkersInJob(const std::string& job_name,
+                                std::vector<std::string>* workers) const = 0;
 
   // If "target" names a remote task for which an RPC channel exists
-  // or can be constructed, returns a new WorkerInterface object
-  // wrapping that channel.  Ownership passes to the caller.
-  // TODO(tucker): rename this to CreateWorker() or something that
-  // makes it more obvious this is a constructor that transfers
-  // ownership, not a cache lookup.
-  virtual WorkerInterface* CreateWorker(const string& target) = 0;
+  // or can be constructed, returns a pointer to a WorkerInterface object
+  // wrapping that channel. The returned value must be destroyed by
+  // calling `this->ReleaseWorker(target, ret)`
+  virtual WorkerInterface* GetOrCreateWorker(const std::string& target) = 0;
 
-  // Set *ba with the BusAdjacency of the specified remote device
-  // within its local environment.  Returns true if the device bus
-  // affinity was set, using only locally cached data.  Returns false
+  // Release a worker previously returned by this->GetOrCreateWorker(target).
+  //
+  // TODO(jeff,sanjay): Consider moving target into WorkerInterface.
+  // TODO(jeff,sanjay): Unify all worker-cache impls and factor out a
+  //                    per-rpc-subsystem WorkerInterface creator.
+  virtual void ReleaseWorker(const std::string& target,
+                             WorkerInterface* worker) {
+    // Subclasses may override to reuse worker objects.
+    delete worker;
+  }
+
+  // Set *locality with the DeviceLocality of the specified remote device
+  // within its local environment.  Returns true if *locality
+  // was set, using only locally cached data.  Returns false
   // if status data for that device was not available.  Never blocks.
-  // TODO(mrry,tucker): Maybe remove.
-  virtual bool GetDeviceBusNonBlocking(const string& device,
-                                       BusAdjacency* ba) = 0;
+  virtual bool GetDeviceLocalityNonBlocking(const std::string& device,
+                                            DeviceLocality* locality) = 0;
 
-  // Set *ba with the BusAdjacency of the specified remote device
-  // within its local environment.  Callback gets Status::OK if the
-  // device bus affinity was set.
-  // TODO(mrry,tucker): Maybe remove.
-  virtual void GetDeviceBusAsync(const string& device, BusAdjacency* ba,
-                                 StatusCallback done) = 0;
+  // Set *locality with the DeviceLocality of the specified remote device
+  // within its local environment.  Callback gets Status::OK if *locality
+  // was set.
+  virtual void GetDeviceLocalityAsync(const std::string& device,
+                                      DeviceLocality* locality,
+                                      StatusCallback done) = 0;
+
+  // TODO(b/189159585): Define a general client cache maker function to
+  // construct client cache of different types sharing the same underling RPC
+  // channels, to replace the eager and coordination cache function.
+  // Build and return a EagerClientCache object wrapping that channel.
+  virtual absl::Status GetEagerClientCache(
+      std::unique_ptr<eager::EagerClientCache>* eager_client_cache) = 0;
+
+  // Build and return a CoordinationClientCache object wrapping that channel.
+  virtual absl::Status GetCoordinationClientCache(
+      std::unique_ptr<CoordinationClientCache>* coordination_client_cache) = 0;
 
   // Start/stop logging activity.
   virtual void SetLogging(bool active) {}
@@ -69,7 +91,7 @@ class WorkerCacheInterface {
 
   // Return logs for the identified step in *ss.  Any returned data will no
   // longer be stored.
-  virtual bool RetrieveLogs(int64 step_id, StepStats* ss) { return false; }
+  virtual bool RetrieveLogs(int64_t step_id, StepStats* ss) { return false; }
 };
 }  // namespace tensorflow
 #endif  // TENSORFLOW_CORE_DISTRIBUTED_RUNTIME_WORKER_CACHE_H_

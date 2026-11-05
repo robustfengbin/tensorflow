@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,10 +15,16 @@ limitations under the License.
 
 // See docs in ../ops/io_ops.cc.
 
-#include <memory>
+#include <string>
+
+#include "absl/status/status.h"
+#include "absl/strings/escaping.h"
+#include "absl/strings/str_cat.h"
+#include "tensorflow/core/framework/reader_base.h"
+#include "tensorflow/core/framework/reader_base.pb.h"
 #include "tensorflow/core/framework/reader_op_kernel.h"
-#include "tensorflow/core/kernels/reader_base.h"
 #include "tensorflow/core/lib/core/errors.h"
+#include "tensorflow/core/lib/strings/str_util.h"
 #include "tensorflow/core/lib/strings/strcat.h"
 #include "tensorflow/core/platform/protobuf.h"
 
@@ -26,35 +32,35 @@ namespace tensorflow {
 
 class IdentityReader : public ReaderBase {
  public:
-  explicit IdentityReader(const string& node_name)
-      : ReaderBase(strings::StrCat("IdentityReader '", node_name, "'")) {}
+  explicit IdentityReader(const std::string& node_name)
+      : ReaderBase(absl::StrCat("IdentityReader '", node_name, "'")) {}
 
-  Status ReadLocked(string* key, string* value, bool* produced,
-                    bool* at_end) override {
+  absl::Status ReadLocked(tstring* key, tstring* value, bool* produced,
+                          bool* at_end) override {
     *key = current_work();
     *value = current_work();
     *produced = true;
     *at_end = true;
-    return Status::OK();
+    return absl::OkStatus();
   }
 
   // Stores state in a ReaderBaseState proto, since IdentityReader has
   // no additional state beyond ReaderBase.
-  Status SerializeStateLocked(string* state) override {
+  absl::Status SerializeStateLocked(tstring* state) override {
     ReaderBaseState base_state;
     SaveBaseState(&base_state);
-    base_state.SerializeToString(state);
-    return Status::OK();
+    SerializeToTString(base_state, state);
+    return absl::OkStatus();
   }
 
-  Status RestoreStateLocked(const string& state) override {
+  absl::Status RestoreStateLocked(const tstring& state) override {
     ReaderBaseState base_state;
     if (!ParseProtoUnlimited(&base_state, state)) {
-      return errors::InvalidArgument("Could not parse state for ", name(), ": ",
-                                     str_util::CEscape(state));
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Could not parse state for ", name(), ": ", absl::CEscape(state)));
     }
     TF_RETURN_IF_ERROR(RestoreBaseState(base_state));
-    return Status::OK();
+    return absl::OkStatus();
   }
 };
 
@@ -67,6 +73,8 @@ class IdentityReaderOp : public ReaderOpKernel {
 };
 
 REGISTER_KERNEL_BUILDER(Name("IdentityReader").Device(DEVICE_CPU),
+                        IdentityReaderOp);
+REGISTER_KERNEL_BUILDER(Name("IdentityReaderV2").Device(DEVICE_CPU),
                         IdentityReaderOp);
 
 }  // namespace tensorflow

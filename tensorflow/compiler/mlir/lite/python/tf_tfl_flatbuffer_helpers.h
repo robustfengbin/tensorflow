@@ -1,0 +1,85 @@
+/* Copyright 2020 The TensorFlow Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+#ifndef TENSORFLOW_COMPILER_MLIR_LITE_PYTHON_TF_TFL_FLATBUFFER_HELPERS_H_
+#define TENSORFLOW_COMPILER_MLIR_LITE_PYTHON_TF_TFL_FLATBUFFER_HELPERS_H_
+
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
+#include "absl/status/status.h"
+#include "absl/strings/string_view.h"
+#include "llvm/Support/raw_ostream.h"
+#include "mlir/IR/BuiltinOps.h"  // from @llvm-project
+#include "mlir/IR/MLIRContext.h"  // from @llvm-project
+#include "mlir/IR/OwningOpRef.h"  // from @llvm-project
+#include "tensorflow/compiler/mlir/lite/common/tfl_pass_config.h"
+#include "tensorflow/compiler/mlir/lite/converter_flags.pb.h"
+#include "tensorflow/compiler/mlir/lite/model_flags.pb.h"
+#include "tensorflow/compiler/mlir/lite/quantization/common/quantization_lib/quantization_config.h"
+#include "tensorflow/compiler/mlir/lite/transforms/passes.h"
+#include "tensorflow/compiler/mlir/lite/types.pb.h"
+#include "tensorflow/compiler/mlir/quantization/tensorflow/python/py_function_lib.h"
+
+namespace tensorflow::internal {
+
+// Register all custom ops including user specified custom ops.
+absl::Status RegisterAllCustomOps(
+    const tflite::ConverterFlags& converter_flags);
+
+// Populate quantization specs (or not) given user specified ranges for each
+// input arrays.
+absl::Status PopulateQuantizationSpecs(
+    const tflite::ModelFlags& model_flags,
+    tflite::ConverterFlags& converter_flags,
+    mlir::TFL::QuantizationSpecs* quant_specs,
+    std::vector<std::string>* node_names, std::vector<std::string>* node_dtypes,
+    std::vector<std::optional<std::vector<int>>>* node_shapes,
+    std::vector<std::optional<double>>* node_mins,
+    std::vector<std::optional<double>>* node_maxs);
+
+// Convert imported MLIR file to TfLite flatbuffer.
+// This will also run relevant passes as well.
+absl::Status ConvertMLIRToTFLiteFlatBuffer(
+    const tflite::ModelFlags& model_flags,
+    tflite::ConverterFlags& converter_flags,
+    std::unique_ptr<mlir::MLIRContext>&& context,
+    mlir::OwningOpRef<mlir::ModuleOp> module,
+    const mlir::TFL::PassConfig& pass_config,
+    const std::unordered_set<std::string>& saved_model_tags,
+    std::string* result,
+    const quantization::PyFunctionLibrary* quantization_py_function_lib);
+
+// Convert slim model in directory to TfLite flatbuffer streamed directly to an
+// output stream.
+absl::Status ConvertMlirBytecodeToTFLite(
+    tflite::ConverterFlags& converter_flags, absl::string_view model_dir,
+    llvm::raw_pwrite_stream& export_stream);
+
+// Convert slim model in directory to TfLite flatbuffer streamed directly to a
+// file.
+absl::Status ConvertMlirBytecodeToTFLite(
+    tflite::ConverterFlags& converter_flags, absl::string_view model_dir,
+    absl::string_view output_file_path);
+
+// Give a warning for any unused flags that have been specified.
+void WarningUnusedFlags(const tflite::ModelFlags& model_flags,
+                        const tflite::ConverterFlags& converter_flags);
+
+}  // namespace tensorflow::internal
+
+#endif  // TENSORFLOW_COMPILER_MLIR_LITE_PYTHON_TF_TFL_FLATBUFFER_HELPERS_H_

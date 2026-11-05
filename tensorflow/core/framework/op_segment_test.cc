@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@ limitations under the License.
 
 #include <vector>
 #include "tensorflow/core/framework/allocator.h"
-#include "tensorflow/core/framework/graph.pb.h"
 #include "tensorflow/core/framework/node_def_builder.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/kernels/ops_util.h"
@@ -39,12 +38,12 @@ class OpSegmentTest : public ::testing::Test {
   OpSegmentTest() : device_(Env::Default()) {
     for (int i = 0; i < 10; ++i) {
       NodeDef def;
-      TF_CHECK_OK(NodeDefBuilder(strings::StrCat("op", i), "Mul")
+      TF_CHECK_OK(NodeDefBuilder(absl::StrCat("op", i), "Mul")
                       .Input("x", 0, DT_INT32)
                       .Input("y", 0, DT_INT32)
                       .Finalize(&def));
       int32_nodedefs_.push_back(def);
-      TF_CHECK_OK(NodeDefBuilder(strings::StrCat("op", i), "Mul")
+      TF_CHECK_OK(NodeDefBuilder(absl::StrCat("op", i), "Mul")
                       .Input("x", 0, DT_FLOAT)
                       .Input("y", 0, DT_FLOAT)
                       .Finalize(&def));
@@ -64,7 +63,7 @@ class OpSegmentTest : public ::testing::Test {
 
   OpSegment::CreateKernelFn GetFn(const NodeDef* ndef) {
     return [this, ndef](OpKernel** kernel) {
-      Status s;
+      absl::Status s;
       auto created = CreateOpKernel(DEVICE_CPU, &device_, cpu_allocator(),
                                     *ndef, TF_GRAPH_DEF_VERSION, &s);
       if (s.ok()) {
@@ -94,17 +93,15 @@ TEST_F(OpSegmentTest, Basic) {
   }
 
   auto reterr = [](OpKernel** kernel) {
-    return errors::Internal("Should not be called");
+    return absl::InternalError("Should not be called");
   };
   for (int i = 0; i < 10; ++i) {
     // Lookup op in session A.
-    TF_EXPECT_OK(
-        opseg.FindOrCreate("A", strings::StrCat("op", i), &op, reterr));
+    TF_EXPECT_OK(opseg.FindOrCreate("A", absl::StrCat("op", i), &op, reterr));
     ValidateOpAndTypes(op, float_nodedefs_[i], DT_FLOAT);
 
     // Lookup op in session B.
-    TF_EXPECT_OK(
-        opseg.FindOrCreate("B", strings::StrCat("op", i), &op, reterr));
+    TF_EXPECT_OK(opseg.FindOrCreate("B", absl::StrCat("op", i), &op, reterr));
     ValidateOpAndTypes(op, int32_nodedefs_[i], DT_INT32);
   }
 
@@ -116,8 +113,8 @@ TEST_F(OpSegmentTest, SessionNotFound) {
   OpSegment opseg;
   OpKernel* op;
   NodeDef def = float_nodedefs_[0];
-  Status s = opseg.FindOrCreate("A", def.name(), &op, GetFn(&def));
-  EXPECT_TRUE(errors::IsNotFound(s)) << s;
+  absl::Status s = opseg.FindOrCreate("A", def.name(), &op, GetFn(&def));
+  EXPECT_TRUE(absl::IsNotFound(s)) << s;
 }
 
 TEST_F(OpSegmentTest, CreateFailure) {
@@ -126,8 +123,8 @@ TEST_F(OpSegmentTest, CreateFailure) {
   NodeDef def = float_nodedefs_[0];
   def.set_op("nonexistop");
   opseg.AddHold("A");
-  Status s = opseg.FindOrCreate("A", def.name(), &op, GetFn(&def));
-  EXPECT_TRUE(errors::IsNotFound(s)) << s;
+  absl::Status s = opseg.FindOrCreate("A", def.name(), &op, GetFn(&def));
+  EXPECT_TRUE(absl::IsNotFound(s)) << s;
   opseg.RemoveHold("A");
 }
 

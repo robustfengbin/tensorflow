@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,42 +15,48 @@ limitations under the License.
 
 #include "tensorflow/core/graph/tensor_id.h"
 
+#include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <string>
 
-#include "tensorflow/core/lib/core/stringpiece.h"
+#include "absl/strings/string_view.h"
+#include "absl/strings/strip.h"
+#include "tensorflow/core/graph/graph.h"
+#include "tensorflow/core/platform/str_util.h"
 
 namespace tensorflow {
 
-TensorId ParseTensorName(const string& name) {
-  return ParseTensorName(StringPiece(name.data(), name.size()));
+TensorId::TensorId(const SafeTensorId& id) : TensorId(id.first, id.second) {}
+
+SafeTensorId::SafeTensorId(const TensorId& id)
+    : SafeTensorId(std::string(id.first), id.second) {}
+
+TensorId ParseTensorName(absl::string_view name) {
+  // Parse either a name, ^name, or name:digits.  To do so, we go backwards from
+  // the end of the string, skipping over a run of digits.  If we hit a ':'
+  // character, then we know we are in the 'name:digits' regime.  Otherwise, we
+  // see if the name starts with '^', indicating a control edge. If we find
+  // neither ':' nor '^' characters, the output index is implicitly 0, and the
+  // whole name string forms the first part of the tensor name.
+  size_t colon_pos = name.rfind(':');
+  if (colon_pos != absl::string_view::npos) {
+    absl::string_view prefix = name.substr(0, colon_pos);
+    absl::string_view suffix = name.substr(colon_pos + 1);
+    uint64_t index;
+    if (str_util::ConsumeLeadingDigits(&suffix, &index) && suffix.empty() &&
+        index <= std::numeric_limits<int>::max()) {
+      return TensorId(prefix, index);
+    }
+  }
+  if (absl::ConsumePrefix(&name, "^")) {
+    return TensorId(name, Graph::kControlSlot);
+  }
+  return TensorId(name, 0);
 }
 
-TensorId ParseTensorName(StringPiece name) {
-  // Parse either a name, or a name:digits.  To do so, we go backwards
-  // from the end of the string, skipping over a run of digits.  If
-  // we hit a ':' character, then we know we are in the 'name:digits'
-  // regime.  Otherwise, the output index is implicitly 0, and the whole
-  // name string forms the first part of the tensor name.
-  //
-  // Equivalent to matching with this regexp: ([^:]+):(\\d+)
-  const char* base = name.data();
-  const char* p = base + name.size() - 1;
-  int index = 0;
-  int mul = 1;
-  while (p > base && (*p >= '0' && *p <= '9')) {
-    index += ((*p - '0') * mul);
-    mul *= 10;
-    p--;
-  }
-  TensorId id;
-  if (p > base && *p == ':' && mul > 1) {
-    id.first = StringPiece(base, p - base);
-    id.second = index;
-  } else {
-    id.first = name;
-    id.second = 0;
-  }
-  return id;
+bool IsTensorIdControl(const TensorId& tensor_id) {
+  return tensor_id.index() == Graph::kControlSlot;
 }
 
 }  // namespace tensorflow

@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,23 +16,28 @@ limitations under the License.
 #include <stdio.h>
 
 #include "tensorflow/core/framework/op_def_util.h"
+#include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/lib/io/path.h"
 #include "tensorflow/core/ops/compat/op_compatibility_lib.h"
 #include "tensorflow/core/platform/env.h"
 #include "tensorflow/core/platform/init_main.h"
+#include "tensorflow/core/platform/path.h"
 #include "tensorflow/core/platform/protobuf.h"
-#include "tensorflow/core/public/version.h"
+#include "tensorflow/core/public/release_version.h"
+#include "tsl/platform/protobuf.h"
 
 namespace tensorflow {
 namespace {
 
-void WriteUpdateTo(const string& directory) {
-  OpCompatibilityLib compatibility(directory);
+void WriteUpdateTo(const std::string& directory) {
+  OpCompatibilityLib compatibility(
+      directory, absl::StrCat("v", TF_MAJOR_VERSION), nullptr);
 
   // Write full copy of all ops to ops.pbtxt.
   Env* env = Env::Default();
   {
-    const string& ops_file = compatibility.ops_file();
+    const std::string& ops_file = compatibility.ops_file();
     printf("Writing ops to %s...\n", ops_file.c_str());
     TF_QCHECK_OK(WriteStringToFile(env, ops_file, compatibility.OpsString()));
   }
@@ -40,19 +45,26 @@ void WriteUpdateTo(const string& directory) {
   // Make sure the current version of ops are compatible with the
   // historical versions, and generate a new history adding all
   // changed ops.
-  OpList out_op_history;
+  OpCompatibilityLib::OpHistory out_op_history;
   int changed_ops = 0;
   int added_ops = 0;
   TF_QCHECK_OK(compatibility.ValidateCompatible(env, &changed_ops, &added_ops,
                                                 &out_op_history));
   printf("%d changed ops\n%d added ops\n", changed_ops, added_ops);
 
-  if (changed_ops + added_ops > 0) {
+  const std::string& history_dir = compatibility.op_history_directory();
+  absl::Status status = env->CreateDir(history_dir);
+  if (!absl::IsAlreadyExists(status)) {
+    TF_QCHECK_OK(status);
+  }
+  if (changed_ops + added_ops > 0 || !absl::IsAlreadyExists(status)) {
     // Write out new op history.
-    const string& history_file = compatibility.op_history_file();
-    printf("Writing updated op history to %s...\n", history_file.c_str());
-    TF_QCHECK_OK(
-        WriteStringToFile(env, history_file, out_op_history.DebugString()));
+    printf("Writing updated op history to %s/...\n", history_dir.c_str());
+    for (const auto& op_file : out_op_history) {
+      TF_QCHECK_OK(
+          WriteStringToFile(env, io::JoinPath(history_dir, op_file.first),
+                            tsl::LegacyUnredactedDebugString(op_file.second)));
+    }
   }
 }
 

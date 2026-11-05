@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,12 +15,22 @@ limitations under the License.
 
 // See docs in ../ops/candidate_sampling_ops.cc.
 
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <type_traits>
+
+#include "absl/log/check.h"
+#include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
+#include "absl/types/span.h"
 #define EIGEN_USE_THREADS
 
 #include <cfloat>
-#include <unordered_map>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/tensor_shape.h"
 #include "tensorflow/core/kernels/range_sampler.h"
@@ -42,11 +52,19 @@ class BaseCandidateSamplerOp : public OpKernel {
   void Compute(OpKernelContext* context) override {
     const Tensor& true_classes = context->input(0);
     OP_REQUIRES(context, true_classes.dims() == 2,
-                errors::InvalidArgument("true_classes must be a matrix"));
-    const int32 batch_size = true_classes.dim_size(0);
+                absl::InvalidArgumentError("true_classes must be a matrix"));
+    const int32_t batch_size = true_classes.dim_size(0);
     OP_REQUIRES(context, true_classes.dim_size(1) == num_true_,
-                errors::InvalidArgument("true_classes must have "
-                                        "num_true columns"));
+                absl::InvalidArgumentError(absl::StrCat(
+                    "true_classes must have "
+                    "num_true columns, expected: ",
+                    true_classes.dim_size(1), " was: ", num_true_)));
+    CHECK(sampler_) << "CandidateSamplerOp did not set sampler_";
+
+    if (unique_) {
+      OP_REQUIRES(context, num_sampled_ <= sampler_->range(),
+                  absl::InvalidArgumentError("Sampler's range is too small."));
+    }
 
     // Output candidates and expected_count.
     Tensor* out_sampled_candidates = nullptr;
@@ -63,29 +81,35 @@ class BaseCandidateSamplerOp : public OpKernel {
                    context->allocate_output(2, TensorShape({num_sampled_}),
                                             &out_sampled_expected_count));
 
-    gtl::ArraySlice<int64> true_candidate(true_classes.matrix<int64>().data(),
-                                          batch_size * num_true_);
-    gtl::MutableArraySlice<int64> sampled_candidate(
-        out_sampled_candidates->vec<int64>().data(), num_sampled_);
-    gtl::MutableArraySlice<float> true_expected_count(
+    absl::Span<const int64_t> true_candidate(
+        true_classes.matrix<int64_t>().data(), batch_size * num_true_);
+
+    for (const auto& candidate : true_candidate) {
+      OP_REQUIRES(context, candidate >= 0 && candidate < sampler_->range(),
+                  absl::InvalidArgumentError(absl::StrCat(
+                      "`true_candidate` out of range [", 0, ", ",
+                      sampler_->range(), "), received ", candidate)));
+    }
+
+    absl::Span<int64_t> sampled_candidate(
+        out_sampled_candidates->vec<int64_t>().data(), num_sampled_);
+    absl::Span<float> true_expected_count(
         out_true_expected_count->matrix<float>().data(),
         batch_size * num_true_);
-    gtl::MutableArraySlice<float> sampled_expected_count(
+    absl::Span<float> sampled_expected_count(
         out_sampled_expected_count->vec<float>().data(), num_sampled_);
-
-    CHECK(sampler_) << "CandidateSamplerOp did not set sampler_";
 
     // Approximately conservatively estimate the number of samples required.
     // In cases where rejection sampling is used we may occasionally use more
     // samples than expected, which will result in reused random bits.
-    const int64 samples32 = 2048 * num_sampled_;
+    const int64_t samples32 = 2048 * num_sampled_;
 
     // Pick sampled candidates.
     auto local_gen = generator_.ReserveSamples32(samples32);
     random::SimplePhilox random(&local_gen);
-    sampler_->SampleBatchGetExpectedCount(&random, unique_, &sampled_candidate,
-                                          &sampled_expected_count,
-                                          true_candidate, &true_expected_count);
+    sampler_->SampleBatchGetExpectedCount(&random, unique_, sampled_candidate,
+                                          sampled_expected_count,
+                                          true_candidate, true_expected_count);
 
     if (sampler_->NeedsUpdates()) {
       sampler_->Update(true_candidate);
@@ -96,8 +120,8 @@ class BaseCandidateSamplerOp : public OpKernel {
   void set_sampler(RangeSampler* sampler) { sampler_.reset(sampler); }
 
  private:
-  int32 num_true_;
-  int32 num_sampled_;
+  int32_t num_true_;
+  int32_t num_sampled_;
   bool unique_;
   std::unique_ptr<RangeSampler> sampler_;
   GuardedPhiloxRandom generator_;
@@ -108,8 +132,18 @@ class SimpleCandidateSamplerOp : public BaseCandidateSamplerOp {
  public:
   explicit SimpleCandidateSamplerOp(OpKernelConstruction* context)
       : BaseCandidateSamplerOp(context) {
-    int64 range_max;
+    int64_t range_max;
     OP_REQUIRES_OK(context, context->GetAttr("range_max", &range_max));
+    if constexpr (std::is_same_v<RangeSamplerType, UnigramSampler> ||
+                  std::is_same_v<RangeSamplerType,
+                                 ThreadUnsafeUnigramSampler>) {
+      // WeightedPicker's largest representable power-of-two level is 1 << 30.
+      constexpr int64_t kMaxUnigramRange = int64_t{1} << 30;
+      OP_REQUIRES(context, range_max <= kMaxUnigramRange,
+                  absl::InvalidArgumentError(absl::StrCat(
+                      "range_max must be at most ", kMaxUnigramRange,
+                      " for unigram samplers, got ", range_max)));
+    }
     set_sampler(new RangeSamplerType(range_max));
   }
 };
@@ -120,19 +154,19 @@ REGISTER_KERNEL_BUILDER(Name("UniformCandidateSampler").Device(DEVICE_CPU),
 REGISTER_KERNEL_BUILDER(Name("LogUniformCandidateSampler").Device(DEVICE_CPU),
                         SimpleCandidateSamplerOp<LogUniformSampler>);
 
-REGISTER_KERNEL_BUILDER(Name("LearnedUnigramCandidateSampler")
-                            .Device(DEVICE_CPU),
-                        SimpleCandidateSamplerOp<UnigramSampler>);
+REGISTER_KERNEL_BUILDER(
+    Name("LearnedUnigramCandidateSampler").Device(DEVICE_CPU),
+    SimpleCandidateSamplerOp<UnigramSampler>);
 
-REGISTER_KERNEL_BUILDER(Name("ThreadUnsafeUnigramCandidateSampler")
-                            .Device(DEVICE_CPU),
-                        SimpleCandidateSamplerOp<ThreadUnsafeUnigramSampler>);
+REGISTER_KERNEL_BUILDER(
+    Name("ThreadUnsafeUnigramCandidateSampler").Device(DEVICE_CPU),
+    SimpleCandidateSamplerOp<ThreadUnsafeUnigramSampler>);
 
 class AllCandidateSamplerOp : public BaseCandidateSamplerOp {
  public:
   explicit AllCandidateSamplerOp(OpKernelConstruction* context)
       : BaseCandidateSamplerOp(context) {
-    int64 range_max;
+    int64_t range_max;
     OP_REQUIRES_OK(context, context->GetAttr("num_sampled", &range_max));
     set_sampler(new AllSampler(range_max));
   }
@@ -145,36 +179,35 @@ class FixedUnigramCandidateSamplerOp : public BaseCandidateSamplerOp {
  public:
   explicit FixedUnigramCandidateSamplerOp(OpKernelConstruction* context)
       : BaseCandidateSamplerOp(context) {
-    int64 range_max;
+    int64_t range_max;
     OP_REQUIRES_OK(context, context->GetAttr("range_max", &range_max));
-    string vocab_file;
+    std::string vocab_file;
     OP_REQUIRES_OK(context, context->GetAttr("vocab_file", &vocab_file));
     std::vector<float> unigrams;
     OP_REQUIRES_OK(context, context->GetAttr("unigrams", &unigrams));
-    OP_REQUIRES(
-        context, !vocab_file.empty() || !unigrams.empty(),
-        errors::InvalidArgument("Must provide either vocab_file or unigrams."));
+    OP_REQUIRES(context, !vocab_file.empty() || !unigrams.empty(),
+                absl::InvalidArgumentError(
+                    "Must provide either vocab_file or unigrams."));
     OP_REQUIRES(context, vocab_file.empty() || unigrams.empty(),
-                errors::InvalidArgument(
+                absl::InvalidArgumentError(
                     "Must only provide one of vocab_file and unigrams."));
     float distortion;
     OP_REQUIRES_OK(context, context->GetAttr("distortion", &distortion));
-    int64 num_reserved_ids;
+    int64_t num_reserved_ids;
     OP_REQUIRES_OK(context,
                    context->GetAttr("num_reserved_ids", &num_reserved_ids));
-    int64 num_shards;
+    int64_t num_shards;
     OP_REQUIRES_OK(context, context->GetAttr("num_shards", &num_shards));
-    int64 shard;
+    int64_t shard;
     OP_REQUIRES_OK(context, context->GetAttr("shard", &shard));
-
-    if (!vocab_file.empty()) {
-      set_sampler(new FixedUnigramSampler(context->env(), range_max, vocab_file,
-                                          distortion, num_reserved_ids,
-                                          num_shards, shard));
-    } else {
-      set_sampler(new FixedUnigramSampler(range_max, unigrams, distortion,
-                                          num_reserved_ids, num_shards, shard));
-    }
+    FixedUnigramSampler* sampler = new FixedUnigramSampler(
+        range_max, distortion, num_reserved_ids, num_shards, shard);
+    if (!vocab_file.empty())
+      OP_REQUIRES_OK(
+          context, sampler->SetDistributionSampler(context->env(), vocab_file));
+    else
+      OP_REQUIRES_OK(context, sampler->SetDistributionSampler(unigrams));
+    set_sampler(sampler);
   }
 };
 
@@ -190,34 +223,38 @@ class ComputeAccidentalHitsOp : public OpKernel {
 
   void Compute(OpKernelContext* context) override {
     const Tensor& in_true_candidates = context->input(0);
-    TensorShape in_true_candidates_shape = in_true_candidates.shape();
-    OP_REQUIRES(context, TensorShapeUtils::IsMatrix(in_true_candidates_shape) &&
-                             in_true_candidates_shape.dim_size(1) == num_true_,
-                errors::InvalidArgument(
+    const TensorShape& in_true_candidates_shape = in_true_candidates.shape();
+    OP_REQUIRES(context,
+                TensorShapeUtils::IsMatrix(in_true_candidates_shape) &&
+                    in_true_candidates_shape.dim_size(1) == num_true_,
+                absl::InvalidArgumentError(
                     "true_candidates must be a batch_size * num_true matrix"));
 
-    const int64 batch_size = in_true_candidates_shape.dim_size(0);
+    const int64_t batch_size = in_true_candidates_shape.dim_size(0);
 
     const Tensor& in_sampled_candidates = context->input(1);
     OP_REQUIRES(context,
                 TensorShapeUtils::IsVector(in_sampled_candidates.shape()),
-                errors::InvalidArgument(
+                absl::InvalidArgumentError(
                     "sampled_candidates must be a vector, which is typically "
                     "an output from CandidateSampler"));
 
-    std::unordered_map<int64, int> sampled_candidate_to_pos;
-    for (int64 i = 0; i < in_sampled_candidates.dim_size(0); ++i) {
-      sampled_candidate_to_pos[in_sampled_candidates.vec<int64>()(i)] = i;
+    const int64_t num_sampled = in_sampled_candidates.dim_size(0);
+    absl::flat_hash_map<int64_t, int> sampled_candidate_to_pos;
+    sampled_candidate_to_pos.reserve(num_sampled);
+    for (int64_t i = 0; i < num_sampled; ++i) {
+      sampled_candidate_to_pos[in_sampled_candidates.vec<int64_t>()(i)] = i;
     }
 
     // Produce output in the same format as UnpackSparseFeatures.
     std::vector<int> indices;
-    std::vector<int64> ids;
+    std::vector<int64_t> ids;
     std::vector<float> weights;
 
-    for (int64 i = 0; i < batch_size; ++i) {
-      for (int64 j = 0; j < num_true_; ++j) {
-        const int64 true_candidate = in_true_candidates.matrix<int64>()(i, j);
+    for (int64_t i = 0; i < batch_size; ++i) {
+      for (int64_t j = 0; j < num_true_; ++j) {
+        const int64_t true_candidate =
+            in_true_candidates.matrix<int64_t>()(i, j);
         const auto look = sampled_candidate_to_pos.find(true_candidate);
         if (look != sampled_candidate_to_pos.end()) {
           indices.push_back(i);
@@ -243,14 +280,14 @@ class ComputeAccidentalHitsOp : public OpKernel {
             2, TensorShape({static_cast<int>(weights.size())}), &out_weights));
 
     for (size_t i = 0; i < indices.size(); ++i) {
-      out_indices->vec<int32>()(i) = indices[i];
-      out_ids->vec<int64>()(i) = ids[i];
+      out_indices->vec<int32_t>()(i) = indices[i];
+      out_ids->vec<int64_t>()(i) = ids[i];
       out_weights->vec<float>()(i) = weights[i];
     }
   }
 
  private:
-  int64 num_true_;
+  int64_t num_true_;
 };
 
 REGISTER_KERNEL_BUILDER(Name("ComputeAccidentalHits").Device(DEVICE_CPU),

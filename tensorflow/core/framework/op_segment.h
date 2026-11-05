@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,8 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef TENSORFLOW_FRAMEWORK_OP_SEGMENT_H_
-#define TENSORFLOW_FRAMEWORK_OP_SEGMENT_H_
+#ifndef TENSORFLOW_CORE_FRAMEWORK_OP_SEGMENT_H_
+#define TENSORFLOW_CORE_FRAMEWORK_OP_SEGMENT_H_
 
 #include <string>
 #include <unordered_map>
@@ -46,8 +46,8 @@ class OpSegment {
 
   // A hold can be placed on a session, preventing all its kernels
   // from being deleted.
-  void AddHold(const string& session_handle);
-  void RemoveHold(const string& session_handle);
+  void AddHold(const std::string& session_handle);
+  void RemoveHold(const std::string& session_handle);
 
   // If the kernel for "node_name" has been created in the
   // "session_handle", returns the existing op kernel in "*kernel".
@@ -56,13 +56,18 @@ class OpSegment {
   // error.
   //
   // OpSegment keeps the ownership of the returned "*kernel".
-  typedef std::function<Status(OpKernel**)> CreateKernelFn;
-  Status FindOrCreate(const string& session_handle, const string& node_name,
-                      OpKernel** kernel, CreateKernelFn create_fn);
+  typedef std::function<absl::Status(OpKernel**)> CreateKernelFn;
+  absl::Status FindOrCreate(const std::string& session_handle,
+                            const std::string& node_name, OpKernel** kernel,
+                            CreateKernelFn create_fn);
+
+  // Returns true if OpSegment should own the kernel.
+  static bool ShouldOwnKernel(FunctionLibraryRuntime* lib,
+                              const std::string& node_op);
 
  private:
   // op name -> OpKernel
-  typedef std::unordered_map<string, OpKernel*> KernelMap;
+  typedef std::unordered_map<std::string, OpKernel*> KernelMap;
   struct Item {
     int num_holds = 1;      // Num of holds put on the session.
     KernelMap name_kernel;  // op name -> kernel.
@@ -71,14 +76,15 @@ class OpSegment {
 
   // session handle -> item.
   // Session handles are produced by strings::FpToString()
-  typedef std::unordered_map<string, Item*> SessionMap;
+  typedef std::unordered_map<std::string, Item*> SessionMap;
 
   mutable mutex mu_;
-  SessionMap sessions_ GUARDED_BY(mu_);
+  SessionMap sessions_ TF_GUARDED_BY(mu_);
 
-  TF_DISALLOW_COPY_AND_ASSIGN(OpSegment);
+  OpSegment(const OpSegment&) = delete;
+  void operator=(const OpSegment&) = delete;
 };
 
 }  // end namespace tensorflow
 
-#endif  // TENSORFLOW_FRAMEWORK_OP_SEGMENT_H_
+#endif  // TENSORFLOW_CORE_FRAMEWORK_OP_SEGMENT_H_

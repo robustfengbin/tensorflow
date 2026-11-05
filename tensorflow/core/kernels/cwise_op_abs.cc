@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,13 +16,19 @@ limitations under the License.
 #include "tensorflow/core/kernels/cwise_ops_common.h"
 
 namespace tensorflow {
-REGISTER4(UnaryOp, CPU, "Abs", functor::abs, float, double, int32, int64);
-#if !defined(__ANDROID__)
-REGISTER_KERNEL_BUILDER(Name("ComplexAbs").Device(DEVICE_CPU),
-                        UnaryOp<CPUDevice, functor::abs<complex64>>);
+
+REGISTER8(UnaryOp, CPU, "Abs", functor::abs, Eigen::half, bfloat16, float,
+          double, int8_t, int16_t, int32_t, int64_t);
+
+REGISTER2(UnaryOp, CPU, "ComplexAbs", functor::abs, complex64, complex128);
+
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+#if !defined(MLIR_GENERATED_GPU_KERNELS_ENABLED)
+REGISTER4(UnaryOp, GPU, "Abs", functor::abs, Eigen::half, float, double, int64);
+REGISTER2(UnaryOp, GPU, "ComplexAbs", functor::abs, complex64, complex128);
 #endif
-#if GOOGLE_CUDA
-REGISTER3(UnaryOp, GPU, "Abs", functor::abs, float, double, int64);
+
+REGISTER(UnaryOp, GPU, "Abs", functor::abs, Eigen::bfloat16);
 
 // A special GPU kernel for int32.
 // TODO(b/25387198): Also enable int32 in device memory. This kernel
@@ -31,8 +37,14 @@ REGISTER_KERNEL_BUILDER(Name("Abs")
                             .Device(DEVICE_GPU)
                             .HostMemory("x")
                             .HostMemory("y")
-                            .TypeConstraint<int32>("T"),
-                        UnaryOp<CPUDevice, functor::abs<int32>>);
+                            .TypeConstraint<int32_t>("T"),
+                        UnaryOp<CPUDevice, functor::abs<int32_t>>);
 #endif
+REGISTER_KERNEL_BUILDER(Name("Abs")
+                            .Device(DEVICE_DEFAULT)
+                            .HostMemory("x")
+                            .HostMemory("y")
+                            .TypeConstraint<int32_t>("T"),
+                        UnaryOp<CPUDevice, functor::abs<int32_t>>);
 
 }  // namespace tensorflow

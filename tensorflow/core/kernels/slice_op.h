@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,12 +13,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef TENSORFLOW_KERNELS_SLICE_OP_H_
-#define TENSORFLOW_KERNELS_SLICE_OP_H_
+#ifndef TENSORFLOW_CORE_KERNELS_SLICE_OP_H_
+#define TENSORFLOW_CORE_KERNELS_SLICE_OP_H_
 
 // Functor definition for SliceOp, must be compilable by nvcc.
 
-#include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
+#include "unsupported/Eigen/CXX11/Tensor"  // from @eigen_archive
 #include "tensorflow/core/framework/tensor_types.h"
 
 namespace tensorflow {
@@ -30,23 +30,16 @@ struct Slice {
                   typename TTypes<T, NDIMS>::ConstTensor input,
                   const Eigen::DSizes<Eigen::DenseIndex, NDIMS>& slice_indices,
                   const Eigen::DSizes<Eigen::DenseIndex, NDIMS>& slice_sizes) {
-    if (Eigen::internal::is_same<Device, Eigen::GpuDevice>::value) {
-      Eigen::DSizes<int, NDIMS> indices;
-      for (int i = 0; i < NDIMS; ++i) {
-        indices[i] = slice_indices[i];
-      }
-      Eigen::DSizes<int, NDIMS> sizes;
-      for (int i = 0; i < NDIMS; ++i) {
-        sizes[i] = slice_sizes[i];
-      }
-      To32Bit(output).device(d) = To32Bit(input).slice(indices, sizes);
-    } else {
-      output.device(d) = input.slice(slice_indices, slice_sizes);
-    }
+    MaybeWith32BitIndexing<Device>(
+        [&](auto output32, auto input32, auto slice_indices32,
+            auto slice_sizes32) {
+          output32.device(d) = input32.slice(slice_indices32, slice_sizes32);
+        },
+        output, input, slice_indices, slice_sizes);
   }
 };
 
 }  // namespace functor
 }  // namespace tensorflow
 
-#endif  // TENSORFLOW_KERNELS_SLICE_OP_H_
+#endif  // TENSORFLOW_CORE_KERNELS_SLICE_OP_H_

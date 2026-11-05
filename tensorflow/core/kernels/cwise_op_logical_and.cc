@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,8 +18,10 @@ limitations under the License.
 namespace tensorflow {
 REGISTER_KERNEL_BUILDER(Name("LogicalAnd").Device(DEVICE_CPU),
                         BinaryOp<CPUDevice, functor::logical_and>);
-#if GOOGLE_CUDA
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+#if !defined(MLIR_GENERATED_GPU_KERNELS_ENABLED)
 REGISTER_KERNEL_BUILDER(Name("LogicalAnd").Device(DEVICE_GPU),
                         BinaryOp<GPUDevice, functor::logical_and>);
-#endif
+#endif  // !defined(MLIR_GENERATED_GPU_KERNELS_ENABLED)
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 }  // namespace tensorflow

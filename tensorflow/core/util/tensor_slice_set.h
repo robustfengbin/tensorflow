@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,14 +16,12 @@ limitations under the License.
 // A class to manage slices of a tensor. You can "register" set of slices for a
 // tensor and then "query" if we have data for a given slice.
 
-// TODO(yangke): consider moving it to a more private place so that we don't
-// need to expose the API.
-
-#ifndef TENSORFLOW_UTIL_TENSOR_SLICE_SET_H_
-#define TENSORFLOW_UTIL_TENSOR_SLICE_SET_H_
+#ifndef TENSORFLOW_CORE_UTIL_TENSOR_SLICE_SET_H_
+#define TENSORFLOW_CORE_UTIL_TENSOR_SLICE_SET_H_
 
 #include <string>  // for string
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "tensorflow/core/framework/tensor_shape.h"
@@ -43,41 +41,29 @@ class TensorSliceSet {
   virtual ~TensorSliceSet();
 
   const TensorShape& shape() const { return shape_; }
-  const DataType type() const { return type_; }
+  DataType type() const { return type_; }
 
   // Register a new slice for the tensor. The "tag" is an arbitrary string
   // associated with the slice (in one application it denotes the name of the
   // file that contains the slice); the "data" points to the data of the tensor
   // slice (it can be a nullptr).
-  // We don't take the ownership of "data" and the caller needs to make sure
-  // the data is always available during the life time of the tensor slice set
-  // if it is not nullptr.
-  Status Register(const TensorSlice& slice, const string& tag,
-                  const float* data);
-
-  // Query about a new slice: checks if we have data for "slice" and if we have
-  // the data and "data" is not nullptr, fill "data" with the slice data. The
-  // caller needs to make sure "data" point to a large enough buffer.
-  // TODO(yangke): avoid unnecessary copying by using a core::RefCounted
-  // pointer.
-  bool Query(const TensorSlice& slice, float* data) const;
+  absl::Status Register(const TensorSlice& slice, const std::string& tag);
 
   // Alternative way of querying about a new slice: instead of copying the
   // data, it returns a list of meta data about the stored slices that will
   // supply data for the slice.
-  bool QueryMeta(
-      const TensorSlice& slice,
-      std::vector<std::pair<tensorflow::TensorSlice, string>>* results) const;
+  bool QueryMeta(const TensorSlice& slice,
+                 std::vector<std::pair<tensorflow::TensorSlice, std::string>>*
+                     results) const;
 
   struct SliceInfo {
     TensorSlice slice;
-    const string tag;
-    const float* data;
-    int64 num_floats;
+    const std::string tag;
+    int64_t num_floats;
   };
 
   // Returns the map from slice string to SliceInfo.
-  const std::unordered_map<string, SliceInfo>& Slices() const {
+  const std::unordered_map<std::string, SliceInfo>& Slices() const {
     return slices_;
   }
 
@@ -85,15 +71,24 @@ class TensorSliceSet {
   const TensorShape shape_;
   const DataType type_;
   // We maintain a mapping from the slice string to the slice information.
-  std::unordered_map<string, SliceInfo> slices_;
+  std::unordered_map<std::string, SliceInfo> slices_;
 
   // Minimal slice which contains all presented slices. Used for speeding up
   // overlap check when slices are being added consequently.
   TensorSlice slices_hull_;
 };
 
+// Registers "slice" in the TensorSliceSet stored in "tensor_slices", under key
+// "name".  Other arguments are used for validations.  Does not modify the map
+// or its values on non-OK.
+// REQUIRES: tensor_slices != nullptr
+absl::Status RegisterTensorSlice(
+    const std::string& name, const TensorShape& shape, DataType type,
+    const std::string& tag, const TensorSlice& slice,
+    std::unordered_map<std::string, TensorSliceSet*>* tensor_slices);
+
 }  // namespace checkpoint
 
 }  // namespace tensorflow
 
-#endif  // TENSORFLOW_UTIL_TENSOR_SLICE_SET_H_
+#endif  // TENSORFLOW_CORE_UTIL_TENSOR_SLICE_SET_H_

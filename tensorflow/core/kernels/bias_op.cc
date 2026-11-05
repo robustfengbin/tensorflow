@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,41 +18,108 @@ limitations under the License.
 #define EIGEN_USE_THREADS
 
 #include "tensorflow/core/kernels/bias_op.h"
-#include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
+
+#include <cstdint>
+#include <limits>
+
+#include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
+#include "unsupported/Eigen/CXX11/Tensor"  // from @eigen_archive
+#include "tensorflow/core/framework/bounds_check.h"
 #include "tensorflow/core/framework/numeric_op.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
 #include "tensorflow/core/framework/tensor.h"
-#include "tensorflow/core/kernels/bounds_check.h"
+#include "tensorflow/core/framework/tensor_shape.h"
+#include "tensorflow/core/kernels/redux_functor.h"
+#include "tensorflow/core/profiler/lib/scoped_annotation.h"
+#include "tensorflow/core/util/determinism.h"
 #include "tensorflow/core/util/tensor_format.h"
 
-#if GOOGLE_CUDA
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+#include "xla/stream_executor/event_based_timer.h"
 #include "tensorflow/core/kernels/bias_op_gpu.h"
 #include "tensorflow/core/platform/stream_executor.h"
-#endif  // GOOGLE_CUDA
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
 namespace tensorflow {
 
 typedef Eigen::ThreadPoolDevice CPUDevice;
 typedef Eigen::GpuDevice GPUDevice;
 
-template <typename Device, typename T>
-class BiasOp;
+namespace {
 
-template <typename T>
-class BiasOp<CPUDevice, T> : public BinaryOp<T> {
+void GetBiasValueDims(const Tensor& value_tensor, TensorFormat data_format,
+                      int32_t* batch, int32_t* height, int32_t* width,
+                      int32_t* depth, int32_t* channel) {
+  *batch = 1;
+  *height = 1;
+  *width = 1;
+  *depth = 1;
+  *channel = 1;
+  if (data_format == FORMAT_NHWC) {
+    int32_t channel_dim = value_tensor.dims() - 1;
+    *channel = static_cast<int32_t>(value_tensor.dim_size(channel_dim));
+    if (value_tensor.NumElements() == 0) {
+      *batch = 0;
+    } else {
+      for (int32_t i = 0; i < channel_dim; i++) {
+        *batch *= static_cast<int32_t>(value_tensor.dim_size(i));
+      }
+    }
+  } else if (data_format == FORMAT_NCHW) {
+    *batch = static_cast<int32_t>(value_tensor.dim_size(0));
+    *channel = static_cast<int32_t>(value_tensor.dim_size(1));
+    *height = static_cast<int32_t>(value_tensor.dim_size(2));
+    if (value_tensor.dims() > 3) {
+      *width = static_cast<int32_t>(value_tensor.dim_size(3));
+    }
+    if (value_tensor.dims() > 4) {
+      *depth = static_cast<int32_t>(value_tensor.dim_size(4));
+    }
+  }
+}
+
+absl::Status ValidateGpuElementCount(const TensorShape& shape) {
+  constexpr int64_t kMaxInt32 = std::numeric_limits<int32_t>::max();
+  bool fits = shape.num_elements() <= kMaxInt32;
+  for (int i = 0; i < shape.dims(); ++i) {
+    fits = fits && shape.dim_size(i) <= kMaxInt32;
+  }
+  if (!fits) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "The GPU kernel supports at most ", kMaxInt32,
+        " elements in total and in each dimension, but the input has shape ",
+        shape.DebugString()));
+  }
+  return absl::OkStatus();
+}
+
+template <class T>
+struct AccumulatorType {
+  typedef T type;
+};
+
+// float is faster on the CPU than half, and also more precise,
+// so use float for the temporary accumulators.
+template <>
+struct AccumulatorType<Eigen::half> {
+  typedef float type;
+};
+
+}  // namespace
+
+template <typename Device, typename T>
+class BiasOp : public BinaryOp<T> {
  public:
-  typedef CPUDevice Device;
   explicit BiasOp(OpKernelConstruction* context) : BinaryOp<T>(context) {
-    string data_format;
+    std::string data_format;
     if (context->GetAttr("data_format", &data_format).ok()) {
       OP_REQUIRES(context, FormatFromString(data_format, &data_format_),
-                  errors::InvalidArgument("Invalid data format"));
+                  absl::InvalidArgumentError("Invalid data format"));
     } else {
       data_format_ = FORMAT_NHWC;
     }
-    OP_REQUIRES(context, data_format_ == FORMAT_NHWC,
-                errors::InvalidArgument("CPU BiasOp only suuports NHWC."));
   }
 
   void Compute(OpKernelContext* context) override {
@@ -61,49 +128,45 @@ class BiasOp<CPUDevice, T> : public BinaryOp<T> {
 
     OP_REQUIRES(context, TensorShapeUtils::IsMatrixOrHigher(input.shape()),
                 errors::InvalidArgument("Input tensor must be at least 2D: ",
-                                        input.shape().DebugString()));
+                                        input.shape()));
+    OP_REQUIRES(context,
+                data_format_ != FORMAT_NCHW || input.shape().dims() >= 3,
+                errors::InvalidArgument(
+                    "NCHW format requires input tensor to be at least 3D: ",
+                    input.shape()));
     OP_REQUIRES(context, TensorShapeUtils::IsVector(bias.shape()),
-                errors::InvalidArgument("Biases must be 1D: ",
-                                        bias.shape().DebugString()));
-    const auto last_dim = input.shape().dims() - 1;
-    OP_REQUIRES(
-        context, bias.shape().dim_size(0) == input.shape().dim_size(last_dim),
-        errors::InvalidArgument(
-            "Must provide as many biases as the last dimension "
-            "of the input tensor: ",
-            bias.shape().DebugString(), " vs. ", input.shape().DebugString()));
+                errors::InvalidArgument("Biases must be 1D: ", bias.shape()));
+
+    // Added by intel_tf to support NCHW on CPU regardless of MKL used or not.
+    int channel_dim;
+    if (data_format_ == FORMAT_NCHW) {
+      channel_dim = 1;  // NCHW always have channel dim in 1 (with 3, 4, 5
+                        // dimensions data).
+    } else {
+      channel_dim = input.shape().dims() - 1;  // End of code by intel_tf.
+    }
+
+    OP_REQUIRES(context,
+                bias.shape().dim_size(0) == input.shape().dim_size(channel_dim),
+                errors::InvalidArgument(
+                    "Must provide as many biases as the last dimension "
+                    "of the input tensor: ",
+                    bias.shape(), " vs. ", input.shape()));
 
     Tensor* output = nullptr;
-    OP_REQUIRES_OK(context,
-                   context->allocate_output(0, input.shape(), &output));
+    OP_REQUIRES_OK(context, context->forward_input_or_allocate_output(
+                                {0}, 0, input.shape(), &output));
+    if (input.NumElements() == 0) return;
 
-    switch (input.shape().dims()) {
-      case 2:
-        Compute<2>(context, input, bias, output);
-        break;
-      case 3:
-        Compute<3>(context, input, bias, output);
-        break;
-      case 4:
-        Compute<4>(context, input, bias, output);
-        break;
-      case 5:
-        Compute<5>(context, input, bias, output);
-        break;
-      default:
-        OP_REQUIRES(context, false,
-                    errors::InvalidArgument("Only ranks up to 5 supported: ",
-                                            input.shape().DebugString()));
+    functor::Bias<Device, T> functor;
+    const Device& d = context->eigen_device<Device>();
+    if (data_format_ == FORMAT_NCHW && input.shape().dims() > 2) {
+      functor(d, input.flat_inner_outer_dims<T, 2>(1),
+              bias.flat_outer_dims<T, 2>(),
+              output->flat_inner_outer_dims<T, 2>(1));
+    } else {
+      functor(d, input.flat<T>(), bias.vec<T>(), output->flat<T>());
     }
-  }
-
-  // Add biases for an input matrix of rank Dims, by using the Bias.
-  template <int Dims>
-  void Compute(OpKernelContext* ctx, const Tensor& input, const Tensor& bias,
-               Tensor* output) {
-    functor::Bias<Device, T, Dims> functor;
-    functor(ctx->eigen_device<Device>(), input.tensor<T, Dims>(), bias.vec<T>(),
-            output->tensor<T, Dims>());
   }
 
  private:
@@ -121,53 +184,17 @@ class BiasOp<CPUDevice, T> : public BinaryOp<T> {
 TF_CALL_NUMBER_TYPES(REGISTER_KERNEL);
 #undef REGISTER_KERNEL
 
-namespace {
-
-void GetBiasValueDims(const Tensor& value_tensor, TensorFormat data_format,
-                      int32* batch, int32* height, int32* width,
-                      int32* channel) {
-  *batch = 1;
-  *width = 1;
-  *height = 1;
-  *channel = 1;
-  if (data_format == FORMAT_NHWC) {
-    int32 channel_dim = value_tensor.dims() - 1;
-    *channel = static_cast<int32>(value_tensor.dim_size(channel_dim));
-    for (int32 i = 0; i < channel_dim; i++) {
-      *batch *= static_cast<int32>(value_tensor.dim_size(i));
-    }
-  } else if (data_format == FORMAT_NCHW) {
-    int32 channel_dim = value_tensor.dims() - 3;
-    int32 height_dim = value_tensor.dims() - 2;
-    int32 width_dim = value_tensor.dims() - 1;
-    *channel = static_cast<int32>(value_tensor.dim_size(channel_dim));
-    *height = static_cast<int32>(value_tensor.dim_size(height_dim));
-    *width = static_cast<int32>(value_tensor.dim_size(width_dim));
-    for (int32 i = 0; i < channel_dim; i++) {
-      *batch *= static_cast<int32>(value_tensor.dim_size(i));
-    }
-  }
-}
-
-}  // namespace
-
 template <typename Device, typename T>
-class BiasGradOp;
-
-template <typename T>
-class BiasGradOp<CPUDevice, T> : public OpKernel {
+class BiasGradOp : public OpKernel {
  public:
-  typedef CPUDevice Device;
   explicit BiasGradOp(OpKernelConstruction* context) : OpKernel(context) {
-    string data_format;
+    std::string data_format;
     if (context->GetAttr("data_format", &data_format).ok()) {
       OP_REQUIRES(context, FormatFromString(data_format, &data_format_),
-                  errors::InvalidArgument("Invalid data format"));
+                  absl::InvalidArgumentError("Invalid data format"));
     } else {
       data_format_ = FORMAT_NHWC;
     }
-    OP_REQUIRES(context, data_format_ == FORMAT_NHWC,
-                errors::InvalidArgument("CPU BiasGradOp only suuports NHWC."));
   }
 
   void Compute(OpKernelContext* context) override {
@@ -176,29 +203,54 @@ class BiasGradOp<CPUDevice, T> : public OpKernel {
     OP_REQUIRES(context,
                 TensorShapeUtils::IsMatrixOrHigher(output_backprop.shape()),
                 errors::InvalidArgument("Input tensor must be at least 2D: ",
-                                        output_backprop.shape().DebugString()));
+                                        output_backprop.shape()));
 
     OP_REQUIRES(
-        context, FastBoundsCheck(output_backprop.NumElements(),
-                                 std::numeric_limits<int32>::max()),
-        errors::InvalidArgument("BiasGrad requires tensor size <= int32 max"));
+        context,
+        data_format_ != FORMAT_NCHW || output_backprop.shape().dims() >= 3,
+        errors::InvalidArgument(
+            "NCHW format requires input tensor to be at least 3D: ",
+            output_backprop.shape()));
 
-    int32 batch, height, width, channel;
-    GetBiasValueDims(output_backprop, data_format_, &batch, &height, &width,
-                     &channel);
+    OP_REQUIRES(context,
+                FastBoundsCheck(output_backprop.NumElements(),
+                                std::numeric_limits<int32_t>::max()),
+                absl::InvalidArgumentError(
+                    "BiasGrad requires tensor size <= int32 max"));
+
+    int channel_dim;
+    if (data_format_ == FORMAT_NCHW) {
+      channel_dim = 1;
+    } else {
+      channel_dim = output_backprop.shape().dims() - 1;
+    }
     Tensor* output = nullptr;
-    TensorShape output_shape{channel};
+    TensorShape output_shape{output_backprop.shape().dim_size(channel_dim)};
     OP_REQUIRES_OK(context, context->allocate_output(0, output_shape, &output));
-    int32 total_count = static_cast<int32>(output_backprop.NumElements());
-    int32 bias_size = channel;
-    const T* output_backprop_data = output_backprop.template flat<T>().data();
-    T* output_data = output->template flat<T>().data();
-    memset(output_data, 0, sizeof(T) * bias_size);
-    int32 bias_index = 0;
-    for (int32 i = 0; i < total_count; i++) {
-      output_data[bias_index++] += output_backprop_data[i];
-      if (bias_index >= bias_size) {
-        bias_index = 0;
+
+    if (output_backprop.NumElements() == 0) {
+      // Eigen often crashes by design on empty tensors, but setZero is safe
+      output->template flat<T>().setZero();
+    } else {
+      // Added by intel_tf to support NCHW on CPU regardless of MKL used or not.
+      using AccumT = typename AccumulatorType<T>::type;
+      if (data_format_ == FORMAT_NCHW) {
+        const functor::ReduceMiddleDimensions<
+            T, AccumT, T, Eigen::internal::scalar_sum_op<AccumT>,
+            Eigen::internal::SumReducer<T>>
+            redux;
+
+        auto flat_outer = output_backprop.flat_outer_dims<T, 3>();
+        redux(context->eigen_device<Device>(), flat_outer.dimensions(),
+              output_backprop, output, 1);
+      } else {
+        const functor::ReduceOuterDimensions<
+            T, AccumT, T, Eigen::internal::scalar_sum_op<AccumT>>
+            redux;
+
+        auto flat_inner = output_backprop.flat_inner_dims<T, 2>();
+        redux(context->eigen_device<Device>(), flat_inner.dimensions(),
+              output_backprop, output);
       }
     }
   }
@@ -216,16 +268,16 @@ class BiasGradOp<CPUDevice, T> : public OpKernel {
 TF_CALL_NUMBER_TYPES(REGISTER_KERNEL);
 #undef REGISTER_KERNEL
 
-#if GOOGLE_CUDA
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 template <typename T>
 class BiasOp<GPUDevice, T> : public BinaryOp<T> {
  public:
   typedef GPUDevice Device;
   explicit BiasOp(OpKernelConstruction* context) : BinaryOp<T>(context) {
-    string data_format;
+    std::string data_format;
     if (context->GetAttr("data_format", &data_format).ok()) {
       OP_REQUIRES(context, FormatFromString(data_format, &data_format_),
-                  errors::InvalidArgument("Invalid data format"));
+                  absl::InvalidArgumentError("Invalid data format"));
     } else {
       data_format_ = FORMAT_NHWC;
     }
@@ -236,26 +288,37 @@ class BiasOp<GPUDevice, T> : public BinaryOp<T> {
     const Tensor& bias = context->input(1);
 
     OP_REQUIRES(context, TensorShapeUtils::IsMatrixOrHigher(input.shape()),
-                errors::InvalidArgument("Input tensor must be at least 2D: ",
-                                        input.shape().DebugString()));
+                absl::InvalidArgumentError(
+                    absl::StrCat("Input tensor must be at least 2D: ",
+                                 input.shape().DebugString())));
+    OP_REQUIRES(context,
+                data_format_ != FORMAT_NCHW || input.shape().dims() >= 3,
+                absl::InvalidArgumentError(absl::StrCat(
+                    "NCHW format requires input tensor to be at least 3D: ",
+                    input.shape().DebugString())));
     OP_REQUIRES(context, TensorShapeUtils::IsVector(bias.shape()),
-                errors::InvalidArgument("Biases must be 1D: ",
-                                        bias.shape().DebugString()));
-    Tensor* output = nullptr;
-    OP_REQUIRES_OK(context,
-                   context->allocate_output(0, input.shape(), &output));
-    int32 batch, height, width, channel;
-    GetBiasValueDims(input, data_format_, &batch, &height, &width, &channel);
+                absl::InvalidArgumentError(absl::StrCat(
+                    "Biases must be 1D: ", bias.shape().DebugString())));
+    OP_REQUIRES_OK(context, ValidateGpuElementCount(input.shape()));
+    int32_t batch, height, width, depth, channel;
+    GetBiasValueDims(input, data_format_, &batch, &height, &width, &depth,
+                     &channel);
     OP_REQUIRES(context, bias.shape().dim_size(0) == channel,
-                errors::InvalidArgument(
+                absl::InvalidArgumentError(absl::StrCat(
                     "Must provide as many biases as the channel dimension "
                     "of the input tensor: ",
                     bias.shape().DebugString(), " vs. ", channel, " in ",
-                    input.shape().DebugString()));
-    BiasGPU<T>::compute(context->template eigen_device<Device>(),
-                        input.flat<T>().data(), bias.flat<T>().data(),
-                        output->flat<T>().data(), batch, width, height, channel,
-                        data_format_);
+                    input.shape().DebugString())));
+    Tensor* output = nullptr;
+    OP_REQUIRES_OK(context, context->forward_input_or_allocate_output(
+                                {0}, 0, input.shape(), &output));
+    if (input.NumElements() > 0) {
+      OP_REQUIRES_OK(context, BiasGPU<T>::compute(
+                                  context->template eigen_device<Device>(),
+                                  input.flat<T>().data(), bias.flat<T>().data(),
+                                  output->flat<T>().data(), batch, width,
+                                  height, depth, channel, data_format_));
+    }
   }
 
  private:
@@ -272,19 +335,157 @@ class BiasOp<GPUDevice, T> : public BinaryOp<T> {
       BiasOp<GPUDevice, type>);
 
 TF_CALL_GPU_NUMBER_TYPES(REGISTER_GPU_KERNEL);
+REGISTER_GPU_KERNEL(int32_t);
 #undef REGISTER_GPU_KERNEL
+
+struct BiasGradAutotuneGroup {
+  static std::string name() { return "BiasGrad"; }
+};
+
+class BiasAddGradGPUConfig {
+ public:
+  BiasAddGradGPUConfig() : mode_(BiasAddGradGPUMode::kReduction) {}
+  std::string ToString() const {
+    if (mode_ == BiasAddGradGPUMode::kNative) {
+      return "native CUDA kernel.";
+    }
+    if (mode_ == BiasAddGradGPUMode::kReduction) {
+      return "cub reduction kernel.";
+    }
+    return "unknown kernel.";
+  }
+  BiasAddGradGPUMode get_mode() const { return mode_; }
+  void set_mode(BiasAddGradGPUMode val) { mode_ = val; }
+
+  bool operator==(const BiasAddGradGPUConfig& other) const {
+    return this->mode_ == other.get_mode();
+  }
+
+  bool operator!=(const BiasAddGradGPUConfig& other) const {
+    return !(*this == other);
+  }
+
+ private:
+  BiasAddGradGPUMode mode_;
+};
+
+// Encapsulate all the shape information that is used in bias add grad
+// operations.
+class BiasAddParams {
+ public:
+  // We use a list to maintain both the shape value and the order (data format).
+  using SpatialArray = absl::InlinedVector<int64_t, 4UL>;
+  BiasAddParams(const SpatialArray& in_shape, TensorFormat data_format,
+                DataType dtype, int device_id)
+      : in_shape_(in_shape),
+        data_format_(data_format),
+        dtype_(dtype),
+        device_id_(device_id) {
+    for (int64_t val : in_shape_) {
+      hash_code_ = Hash64Combine(hash_code_, val);
+    }
+    hash_code_ = Hash64Combine(hash_code_, data_format);
+    hash_code_ = Hash64Combine(hash_code_, dtype);
+    hash_code_ = Hash64Combine(hash_code_, device_id);
+  }
+  bool operator==(const BiasAddParams& other) const {
+    return this->get_data_as_tuple() == other.get_data_as_tuple();
+  }
+
+  bool operator!=(const BiasAddParams& other) const {
+    return !(*this == other);
+  }
+  uint64_t hash() const { return hash_code_; }
+
+  std::string ToString() const {
+    // clang-format off
+    return strings::StrCat(
+        "(", absl::StrJoin(in_shape_, ", "), "), ",
+        data_format_, ", ", dtype_, ", ", device_id_);
+    // clang-format on
+  }
+
+ protected:
+  using ParamsDataType = std::tuple<SpatialArray, TensorFormat, DataType, int>;
+
+  ParamsDataType get_data_as_tuple() const {
+    return std::make_tuple(in_shape_, data_format_, dtype_, device_id_);
+  }
+
+  uint64_t hash_code_ = 0;
+
+ private:
+  SpatialArray in_shape_;
+  TensorFormat data_format_;
+  DataType dtype_;
+  int device_id_;
+};
+
+typedef AutotuneSingleton<BiasGradAutotuneGroup, BiasAddParams,
+                          BiasAddGradGPUConfig>
+    AutotuneBiasGrad;
 
 template <typename T>
 class BiasGradOp<GPUDevice, T> : public OpKernel {
  public:
   typedef GPUDevice Device;
   explicit BiasGradOp(OpKernelConstruction* context) : OpKernel(context) {
-    string data_format;
+    std::string data_format;
     if (context->GetAttr("data_format", &data_format).ok()) {
       OP_REQUIRES(context, FormatFromString(data_format, &data_format_),
-                  errors::InvalidArgument("Invalid data format"));
+                  absl::InvalidArgumentError("Invalid data format"));
     } else {
       data_format_ = FORMAT_NCHW;
+    }
+  }
+
+  void ComputeWithCustomKernel(OpKernelContext* context,
+                               const Tensor& output_backprop, int32_t batch,
+                               int32_t width, int32_t height, int32_t depth,
+                               int32_t channel, Tensor* output) {
+    OP_REQUIRES_OK(context, BiasGradGPU<T>::compute(
+                                context->template eigen_device<Device>(),
+                                output_backprop.template flat<T>().data(),
+                                output->flat<T>().data(), batch, width, height,
+                                depth, channel, data_format_));
+  }
+
+  void ComputeWithReduceSum(OpKernelContext* context,
+                            const Tensor& output_backprop, int32_t batch,
+                            int32_t width, int32_t height, int32_t depth,
+                            int32_t channel, Tensor* output) {
+    if (data_format_ == FORMAT_NCHW) {
+      int32_t row_count = batch * channel;
+      int32_t col_count = height * width * depth;
+      if (col_count == 1) {
+        BiasGradGPU<T>::DoColReduction(
+            context, output->flat<T>().data(),
+            output_backprop.template flat<T>().data(), batch, channel);
+        return;
+      }
+      Tensor temp_grad_outputs;
+      // For 'NCHW' format, we perform reduction twice: first HW, then N.
+      TensorShape temp_grad_output_shape{row_count, col_count};
+      OP_REQUIRES_OK(context, context->allocate_temp(DataTypeToEnum<T>::value,
+                                                     temp_grad_output_shape,
+                                                     &temp_grad_outputs));
+      BiasGradGPU<T>::DoRowReduction(
+          context, temp_grad_outputs.flat<T>().data(),
+          output_backprop.template flat<T>().data(), row_count, col_count);
+
+      row_count = batch;
+      col_count = channel;
+      BiasGradGPU<T>::DoColReduction(context, output->flat<T>().data(),
+                                     temp_grad_outputs.flat<T>().data(),
+                                     row_count, col_count);
+    } else {
+      // For 'NHWC', we simply apply reduction once on NHW.
+      int32_t row_count = batch * height * width * depth;
+      int32_t col_count = channel;
+      BiasGradGPU<T>::DoColReduction(
+          context, const_cast<T*>(output->flat<T>().data()),
+          reinterpret_cast<const T*>(output_backprop.template flat<T>().data()),
+          row_count, col_count);
     }
   }
 
@@ -293,23 +494,106 @@ class BiasGradOp<GPUDevice, T> : public OpKernel {
 
     OP_REQUIRES(context,
                 TensorShapeUtils::IsMatrixOrHigher(output_backprop.shape()),
-                errors::InvalidArgument("Input tensor must be at least 2D: ",
-                                        output_backprop.shape().DebugString()));
-    int32 batch, height, width, channel;
+                absl::InvalidArgumentError(
+                    absl::StrCat("Input tensor must be at least 2D: ",
+                                 output_backprop.shape().DebugString())));
+    OP_REQUIRES(
+        context,
+        data_format_ != FORMAT_NCHW || output_backprop.shape().dims() >= 3,
+        absl::InvalidArgumentError(absl::StrCat(
+            "NCHW format requires input tensor to be at least 3D: ",
+            output_backprop.shape().DebugString())));
+    OP_REQUIRES_OK(context, ValidateGpuElementCount(output_backprop.shape()));
+    int32_t batch, height, width, depth, channel;
     GetBiasValueDims(output_backprop, data_format_, &batch, &height, &width,
-                     &channel);
+                     &depth, &channel);
     Tensor* output = nullptr;
     TensorShape output_shape{channel};
     OP_REQUIRES_OK(context, context->allocate_output(0, output_shape, &output));
+    if (channel == 0) return;
     auto* stream = context->op_device_context()->stream();
-    OP_REQUIRES(context, stream, errors::Internal("No GPU stream available."));
-    perftools::gputools::DeviceMemoryBase output_ptr(
+    OP_REQUIRES(context, stream,
+                absl::InternalError("No GPU stream available."));
+    stream_executor::DeviceAddressBase output_ptr(
         output->flat<T>().data(), output->NumElements() * sizeof(T));
-    stream->ThenMemset32(&output_ptr, 0, output->NumElements() * sizeof(T));
-    BiasGradGPU<T>::compute(context->template eigen_device<Device>(),
-                            output_backprop.template flat<T>().data(),
-                            output->flat<T>().data(), batch, width, height,
-                            channel, data_format_);
+    OP_REQUIRES_OK(context, stream->MemZero(&output_ptr,
+                                            output->NumElements() * sizeof(T)));
+    if (output_backprop.NumElements() <= 0) return;
+    if (OpDeterminismRequired()) {
+      // ComputeWithReduceSum is the only deterministic algorithm.
+      ComputeWithReduceSum(context, output_backprop, batch, width, height,
+                           depth, channel, output);
+      return;
+    }
+
+    int device_id = stream->parent()->device_ordinal();
+    DataType dtype = output_backprop.dtype();
+    BiasAddParams bias_parameters = {
+        {batch, height * width * depth, channel},
+        data_format_,
+        dtype,
+        device_id,
+    };
+
+    // Autotune two algorithm: customized
+    BiasAddGradGPUConfig algo_config;
+    if (!AutotuneBiasGrad::GetInstance()->Find(bias_parameters, &algo_config)) {
+      tsl::profiler::ScopedAnnotation trace("bias_grad_autotuning");
+
+      BiasGradGPUProfileResult best_result;
+
+      // Initialize the timer.
+      absl::StatusOr<std::unique_ptr<stream_executor::EventBasedTimer>> timer =
+          stream->CreateEventBasedTimer(false);
+      OP_REQUIRES_OK(context, timer.status());
+      ComputeWithCustomKernel(context, output_backprop, batch, width, height,
+                              depth, channel, output);
+      absl::StatusOr<absl::Duration> bias_duration =
+          timer.value()->GetElapsedDuration();
+      OP_REQUIRES_OK(context, bias_duration.status());
+      int64_t elapsed_microseconds = absl::ToInt64Microseconds(*bias_duration);
+
+      VLOG(1) << "BiasAddGrad " << bias_parameters.ToString()
+              << " Native algo latency: " << elapsed_microseconds << "us";
+      if (elapsed_microseconds < best_result.elapsed_time()) {
+        best_result.set_algorithm(BiasAddGradGPUMode::kNative);
+        best_result.set_elapsed_time(elapsed_microseconds);
+      }
+
+      // Try reduction and profile.
+      absl::StatusOr<std::unique_ptr<stream_executor::EventBasedTimer>>
+          reduction_timer = stream->CreateEventBasedTimer(false);
+      OP_REQUIRES_OK(context, reduction_timer.status());
+      ComputeWithReduceSum(context, output_backprop, batch, width, height,
+                           depth, channel, output);
+      absl::StatusOr<absl::Duration> reduction_duration =
+          reduction_timer.value()->GetElapsedDuration();
+      OP_REQUIRES_OK(context, reduction_duration.status());
+
+      elapsed_microseconds += absl::ToInt64Microseconds(*reduction_duration);
+      VLOG(1) << "BiasAddGrad " << bias_parameters.ToString()
+              << " Reduction algo latency: " << elapsed_microseconds;
+      if (elapsed_microseconds < best_result.elapsed_time()) {
+        best_result.set_algorithm(BiasAddGradGPUMode::kReduction);
+        best_result.set_elapsed_time(elapsed_microseconds);
+      }
+
+      algo_config.set_mode(best_result.algorithm());
+      AutotuneBiasGrad::GetInstance()->Insert(bias_parameters, algo_config);
+
+      // Results are already available during autotune, so no need to continue.
+      return;
+    }
+
+    // Choose the best algorithm based on autotune results.
+    if (algo_config.get_mode() == BiasAddGradGPUMode::kReduction) {
+      ComputeWithReduceSum(context, output_backprop, batch, width, height,
+                           depth, channel, output);
+    } else {
+      // Default to the customized kernel.
+      ComputeWithCustomKernel(context, output_backprop, batch, width, height,
+                              depth, channel, output);
+    }
   }
 
  private:
@@ -325,6 +609,6 @@ class BiasGradOp<GPUDevice, T> : public OpKernel {
 TF_CALL_GPU_NUMBER_TYPES(REGISTER_GPU_KERNEL);
 #undef REGISTER_GPU_KERNEL
 
-#endif  // GOOGLE_CUDA
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
 }  // namespace tensorflow

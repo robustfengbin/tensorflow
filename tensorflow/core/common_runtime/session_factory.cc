@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,16 +22,18 @@ limitations under the License.
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/platform/mutex.h"
 #include "tensorflow/core/platform/types.h"
+#include "tensorflow/core/protobuf/config.pb.h"
 #include "tensorflow/core/public/session_options.h"
+
 namespace tensorflow {
 namespace {
 
 static mutex* get_session_factory_lock() {
-  static mutex session_factory_lock;
+  static mutex session_factory_lock(LINKER_INITIALIZED);
   return &session_factory_lock;
 }
 
-typedef std::unordered_map<string, SessionFactory*> SessionFactories;
+typedef std::unordered_map<std::string, SessionFactory*> SessionFactories;
 SessionFactories* session_factories() {
   static SessionFactories* factories = new SessionFactories;
   return factories;
@@ -39,31 +41,35 @@ SessionFactories* session_factories() {
 
 }  // namespace
 
-void SessionFactory::Register(const string& runtime_type,
+void SessionFactory::Register(const std::string& runtime_type,
                               SessionFactory* factory) {
   mutex_lock l(*get_session_factory_lock());
   if (!session_factories()->insert({runtime_type, factory}).second) {
     LOG(ERROR) << "Two session factories are being registered "
-               << "under" << runtime_type;
+               << "under " << runtime_type;
   }
 }
 
 namespace {
-const string RegisteredFactoriesErrorMessageLocked() {
-  std::vector<string> factory_types;
+const std::string RegisteredFactoriesErrorMessageLocked() {
+  std::vector<std::string> factory_types;
   for (const auto& session_factory : *session_factories()) {
     factory_types.push_back(session_factory.first);
   }
-  return strings::StrCat("Registered factories are {",
-                         str_util::Join(factory_types, ", "), "}.");
+  return absl::StrCat("Registered factories are {",
+                      absl::StrJoin(factory_types, ", "), "}.");
+}
+std::string SessionOptionsToString(const SessionOptions& options) {
+  return absl::StrCat("target: \"", options.target,
+                      "\" config: ", options.config.ShortDebugString());
 }
 }  // namespace
 
-Status SessionFactory::GetFactory(const SessionOptions& options,
-                                  SessionFactory** out_factory) {
+absl::Status SessionFactory::GetFactory(const SessionOptions& options,
+                                        SessionFactory** out_factory) {
   mutex_lock l(*get_session_factory_lock());  // could use reader lock
 
-  std::vector<std::pair<string, SessionFactory*>> candidate_factories;
+  std::vector<std::pair<std::string, SessionFactory*>> candidate_factories;
   for (const auto& session_factory : *session_factories()) {
     if (session_factory.second->AcceptsOptions(options)) {
       VLOG(2) << "SessionFactory type " << session_factory.first
@@ -77,7 +83,7 @@ Status SessionFactory::GetFactory(const SessionOptions& options,
 
   if (candidate_factories.size() == 1) {
     *out_factory = candidate_factories[0].second;
-    return Status::OK();
+    return absl::OkStatus();
   } else if (candidate_factories.size() > 1) {
     // NOTE(mrry): This implementation assumes that the domains (in
     // terms of acceptable SessionOptions) of the registered
@@ -87,19 +93,22 @@ Status SessionFactory::GetFactory(const SessionOptions& options,
     // the number of sessions grows.
     // TODO(mrry): Consider providing a system-default fallback option
     // in this case.
-    std::vector<string> factory_types;
+    std::vector<std::string> factory_types;
+    factory_types.reserve(candidate_factories.size());
     for (const auto& candidate_factory : candidate_factories) {
       factory_types.push_back(candidate_factory.first);
     }
-    return errors::Internal(
-        "Multiple session factories registered for the given session options. "
-        "Candidate factories are {",
-        str_util::Join(factory_types, ", "), "}. ",
-        RegisteredFactoriesErrorMessageLocked());
+    return absl::InternalError(absl::StrCat(
+        "Multiple session factories registered for the given session "
+        "options: {",
+        SessionOptionsToString(options), "} Candidate factories are {",
+        absl::StrJoin(factory_types, ", "), "}. ",
+        RegisteredFactoriesErrorMessageLocked()));
   } else {
-    return errors::NotFound(
-        "No session factory registered for the given session options. ",
-        RegisteredFactoriesErrorMessageLocked());
+    return absl::NotFoundError(absl::StrCat(
+        "No session factory registered for the given session options: {",
+        SessionOptionsToString(options), "} ",
+        RegisteredFactoriesErrorMessageLocked()));
   }
 }
 

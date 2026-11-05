@@ -1,4 +1,4 @@
-/* Copyright 2016 Google Inc. All Rights Reserved.
+/* Copyright 2016 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -31,12 +31,14 @@ namespace tensorflow {
 // device status attributes.
 class WorkerCachePartial : public WorkerCacheInterface {
  public:
-  bool GetDeviceBusNonBlocking(const string& device, BusAdjacency* ba) override;
+  bool GetDeviceLocalityNonBlocking(const std::string& device,
+                                    DeviceLocality* locality) override;
 
-  void GetDeviceBusAsync(const string& device, BusAdjacency* ba,
-                         StatusCallback) override;
+  void GetDeviceLocalityAsync(const std::string& device,
+                              DeviceLocality* locality,
+                              StatusCallback) override;
 
-  ~WorkerCachePartial() override {}
+  ~WorkerCachePartial() override = default;
 
   // Clear all entries from the DeviceStatus cache.
   void FlushStatusCache();
@@ -46,10 +48,10 @@ class WorkerCachePartial : public WorkerCacheInterface {
 
   // Initiate a GetStatusAsync to the remote task named by "task", and
   // update the cache with all the DeviceAttributes reported.
-  Status RefreshDeviceStatus(const string& device_name);
+  absl::Status RefreshDeviceStatus(const std::string& device_name);
 
-  typedef std::unordered_map<string, DeviceAttributes> StatusMap;
-  StatusMap device_status_cache_ GUARDED_BY(mu_);
+  typedef std::unordered_map<std::string, DeviceAttributes> StatusMap;
+  StatusMap device_status_cache_ TF_GUARDED_BY(mu_);
 };
 
 }  // namespace tensorflow
